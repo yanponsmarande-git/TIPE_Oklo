@@ -19,8 +19,3 @@ uniform_dist = openmc.stats.Box(bounds[:3], bounds[3:], only_fissionable=True)
 settings.source = openmc.IndependentSource(space=uniform_dist)
 
 settings.export_to_xml()
-
-print("Settings exportés avec succès !")
-print(f"\nNeutrons par cycle : {settings.particles}")
-print(f"Cycles inactifs    : {settings.inactive}")
-print(f"Cycles actifs      : {settings.batches - settings.inactive}")
