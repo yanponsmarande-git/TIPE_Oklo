@@ -1,0 +1,1151 @@
+# -*- coding: utf-8 -*-
+"""
+=============================================================================
+ MODELISATION DU REACTEUR NATUREL RZ9 D'OKLO
+ Objectif : faire emerger le fonctionnement cyclique (~30 min de marche pour
+            ~2 h 30 d'arret) a partir des seules lois de la physique.
+=============================================================================
+
+STRUCTURE DU MODELE
+-------------------
+  1. Constantes physiques et donnees nucleaires
+  2. Geometrie et composition du coeur  (tout est deduit de la mineralogie)
+  3. Proprietes de l'eau a 150 bar      (correlation IAPWS de saturation)
+  4. Neutronique : formule des 6 facteurs calculee a partir de la composition
+  5. Thermique   : coeur 0D (enthalpie) + argile 1D (conduction transitoire)
+  6. Cinetique ponctuelle a 6 groupes de neutrons retardes
+  7. Integrateur a pas adaptatif (cinetique resolue par exponentielle de
+     matrice : exacte, donc sans amortissement numerique parasite)
+  8. Diagnostic automatique des cycles + traces
+
+PRINCIPE PHYSIQUE DU CYCLE (oscillateur de relaxation)
+------------------------------------------------------
+  Le coeur est poreux ; l'eau qui remplit la porosite EST le moderateur. Sa
+  masse volumique chute de 0.5 % par kelvin au voisinage de 340 degC, ce qui
+  donne un coefficient de temperature enorme : environ -90 pcm/K. Le reacteur
+  est donc violemment contre-reactionne... mais avec du RETARD, car pour se
+  dilater l'eau doit etre chassee des pores a travers la roche (ecoulement de
+  Darcy, constante de temps tau_h). La boucle
+
+      puissance -> temperature -> (retard tau_h) -> densite d'eau -> reactivite
+
+  cumule alors plus de 180 degres de dephasage : l'etat stationnaire devient
+  INSTABLE et le systeme tombe sur un cycle limite. C'est un oscillateur de
+  relaxation, pas une oscillation amortie : sa periode et son amplitude ne
+  dependent pas des conditions initiales.
+
+  Deroulement d'un cycle :
+   1. arret  : le coeur se refroidit lentement par conduction (~10 kW), l'eau
+               se contracte et se redensifie, k_eff remonte vers 1 ;
+   2. amorcage : au passage de la criticite, la population neutronique repart
+               de la source de fission spontanee de l'U238 et croit de
+               plusieurs decades a la periode des neutrons retardes ;
+   3. marche : la puissance depasse ce que la conduction evacue, le coeur se
+               rechauffe de quelques kelvins, l'eau se dilate et est chassee
+               des pores -> k_eff s'effondre ;
+   4. extinction : la puissance s'effondre en quelques minutes, et tout
+               recommence a l'identique.
+
+  L'asymetrie marche/arret n'est pas imposee : la fission depose l'energie
+  environ 5 fois plus vite que la conduction ne l'evacue, donc
+        t_arret / t_marche ~ P_marche / P_conduction - 1 ~ 5.
+  Si la contre-reaction liquide ne suffit pas a stopper l'excursion avant
+  615 K, le modele bascule automatiquement en diphasique (vaporisation) : le
+  code gere les deux regimes.
+
+RESULTAT
+--------
+  marche 31 min | arret 163 min | puissance moyenne 16 kW
+  (Oklo : marche 30 min | arret 150 min | ~6 a 100 kW selon les auteurs)
+
+  Dans cette configuration le coeur oscille entre 609.5 et 612.3 K, donc SANS
+  jamais bouillir : c'est la dilatation de l'eau liquide, retardee, qui pilote
+  le cycle. Le regime diphasique existe (mettre K_MARGINAL > 1) mais il donne
+  des cycles de 10 min / 60 min avec des pointes a 108 MW, incompatibles avec
+  l'enregistrement isotopique. Voir DOCUMENTATION.md, section 10.4.
+
+CE QUI N'EST *PAS* CALCULE DEPUIS LES PREMIERS PRINCIPES
+---------------------------------------------------------
+  Quatre grandeurs geologiques sont inconnues ; ce sont les seuls parametres :
+    - POROSITE          : fraction volumique d'eau dans la lentille (0.05-0.40)
+    - PERMEABILITE      : fixe tau_h, le retard hydraulique   (1e-15 a 1e-12 m2)
+    - E_GRES            : distance a laquelle l'encaissant impose 150 degC
+    - REFLECTOR_SAVINGS : gain de reflecteur, cale sur la criticite marginale
+  Aucune de ces quatre grandeurs n'est une duree : les 30 min et les 2 h 30 ne
+  sont donc jamais donnees au programme, elles en sortent. La fonction
+  etude_sensibilite() montre comment le cycle depend de chacune.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from time import perf_counter
+
+# ===========================================================================
+# 1. CONSTANTES PHYSIQUES ET DONNEES NUCLEAIRES
+# ===========================================================================
+
+N_A   = 6.02214076e23        # mol^-1
+BARN  = 1.0e-28              # m^2
+EV    = 1.602176634e-19      # J
+
+# Energie recuperable par fission (Lamarsh & Baratta, ch. 3 ; decroissance
+# des produits de fission incluse : 7 % apres quelques jours de marche)
+E_FISS_COEUR = 195.0e6 * EV  # J deposes dans la lentille (fragments, beta, 2/3 gamma)
+E_FISS_EXT   =  20.0e6 * EV  # J deposes dans l'argile (gamma s'echappant)
+E_FISS_TOT   = E_FISS_COEUR + E_FISS_EXT
+
+NU_BAR = 2.42                # neutrons par fission thermique de l'U235
+
+# --- Neutrons retardes de l'U235 (6 groupes, Keepin) ---
+BETA_I   = np.array([2.15e-4, 1.424e-3, 1.274e-3, 2.568e-3, 7.48e-4, 2.73e-4])
+LAMBDA_I = np.array([0.0124, 0.0305, 0.111, 0.301, 1.14, 3.01])   # s^-1
+BETA     = BETA_I.sum()      # = 6.50e-3
+
+# --- Puissance residuelle (decroissance beta et gamma des produits de fission) ---
+# Une fraction GAMMA_DEC de l'energie de fission n'est PAS liberee au moment de
+# la fission : elle est stockee dans les produits de fission et restituee avec
+# un retard reparti de la seconde a la journee. Ce retard est essentiel : il
+# introduit un dephasage dans la boucle puissance -> temperature -> reactivite,
+# ce qui rend l'etat stationnaire instable et entretient l'oscillation.
+# Ajustement de f(t) = 0.0622 t^-0.2 (U235, marche infinie) par 6 exponentielles.
+LAMBDA_DEC = np.array([1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-6])          # s^-1
+GAMMA_DEC_I = np.array([0.030973, 0.019458, 0.012998,
+                        0.006791, 0.006749, 0.007314])
+GAMMA_DEC = GAMMA_DEC_I.sum()          # ~8.4 % de l'energie de fission
+
+# --- Fission spontanee (source d'amorcage et de re-amorcage) ---
+# L'U238 domine tres largement : T(1/2, SF) = 8.2e15 ans
+TAUX_SF_U238 = 6.8e-3        # fissions.g^-1.s^-1
+TAUX_SF_U235 = 5.7e-6        # fissions.g^-1.s^-1
+NU_SF        = 2.0           # neutrons par fission spontanee
+
+# --- Sections efficaces microscopiques a 2200 m/s (barns) ---
+# sigma_a : absorption | sigma_s : diffusion potentielle | sigma_tr : transport
+DONNEES = {
+    #        A       sigma_a   sigma_s   sigma_tr
+    'H':   ( 1.008,  0.3326,   20.0,     29.3 ),   # lie dans H2O (sigma_tr effectif)
+    'O':   (15.999,  0.00019,   3.76,     3.60),
+    'Si':  (28.086,  0.171,     2.17,     2.10),
+    'Al':  (26.982,  0.231,     1.50,     1.45),
+    'Fe':  (55.845,  2.56,     11.4,     11.0 ),
+    'Mg':  (24.305,  0.063,     3.60,     3.50),
+    'K':   (39.098,  2.10,      1.50,     1.50),
+    'Ca':  (40.078,  0.43,      3.00,     3.00),
+    'U235':(235.04, 680.9,     15.0,     15.0 ),
+    'U238':(238.05,   2.68,     8.90,     8.90),
+}
+SIGMA_F_U235 = 582.6         # barns, fission thermique a 2200 m/s
+
+def xi_ralentissement(A):
+    """Decrement logarithmique moyen d'energie par choc elastique."""
+    if A <= 1.01:
+        return 1.0
+    a = ((A - 1.0) / (A + 1.0))**2
+    return 1.0 + a * np.log(a) / (1.0 - a)
+
+XI = {el: xi_ralentissement(d[0]) for el, d in DONNEES.items()}
+
+# --- Facteurs de Westcott de l'U235 (ecart a la loi 1/v) ---
+# Le spectre thermique est maxwellien a la temperature du moderateur.
+T_WESTCOTT = np.array([293.6, 400.0, 500.0, 600.0, 700.0, 800.0, 1000.0])
+G_ABS_U235 = np.array([0.9780, 0.9759, 0.9821, 0.9970, 1.0173, 1.0400, 1.0854])
+G_FIS_U235 = np.array([0.9759, 0.9581, 0.9560, 0.9636, 0.9760, 0.9909, 1.0210])
+
+T_REF_NEUTRON = 293.6        # K, temperature de reference des sections efficaces
+
+# --- Effet Doppler sur l'integrale de resonance de l'U238 ---
+# I_eff(T) = I_eff(T0) * [1 + BETA_DOPPLER * (sqrt(T) - sqrt(T0))]
+BETA_DOPPLER = 0.0075        # K^-1/2 (milieu quasi homogene)
+
+# --- Facteur de fission rapide ---
+# SEULE grandeur neutronique non calculee depuis la composition. Dans un milieu
+# quasi homogene et tres dilue en uranium (5 % d'uraninite en volume), un
+# neutron rapide a tres peu de chances de rencontrer un noyau d'U238 avant
+# d'etre ralenti sous le seuil de fission rapide (~1 MeV) : epsilon reste tres
+# proche de 1. La valeur exacte est sans effet sur la DYNAMIQUE (c'est une
+# constante multiplicative de k_eff, absorbee par l'etalonnage du reflecteur) ;
+# elle ne deplace que le gain de reflecteur d'etalonnage.
+EPSILON = 1.02
+
+
+# ===========================================================================
+# 2. GEOMETRIE ET COMPOSITION
+# ===========================================================================
+
+# La lentille mesure 12 m x 7 m x 0.70 m. On lui substitue un cylindre de meme
+# empreinte au sol : R = sqrt(12*7/pi) = 5.17 m. (Prendre R = 2.10 m comme dans
+# la version precedente revenait a diviser le volume par 6 et surestimait
+# enormement les fuites radiales.)
+R_COEUR = np.sqrt(12.0 * 7.0 / np.pi)           # 5.17 m
+H_COEUR = 0.70               # m
+V_COEUR = np.pi * R_COEUR**2 * H_COEUR          # 58.8 m3
+
+# --- Combustible : uraninite UO2 ---
+FRAC_VOL_URANINITE = 0.05    # "uraninite volume fraction taken equal to 5%"
+RHO_URANINITE      = 10600.0 # kg.m-3
+M_MOL_UO2          = 0.2700  # kg.mol-1
+FRAC_MASSE_U       = 0.8815  # fraction massique d'U dans UO2
+ENRICHISSEMENT     = 0.035   # 3.5 % d'U235 il y a 2 milliards d'annees
+CP_UO2             = 300.0   # J.kg-1.K-1
+
+# --- Porosite (moderateur) : PARAMETRE GEOLOGIQUE INCERTAIN ---
+POROSITE = 0.35              # fraction volumique occupee par le fluide
+
+# --- Matrice argilo-silicatee (le reste du volume) ---
+RHO_MATRICE = 2650.0         # kg.m-3 (masse volumique des grains)
+CP_MATRICE  = 900.0          # J.kg-1.K-1
+# Composition massique moyenne d'une argile illitique de gres uranifere
+OXYDES = {   # oxyde : (fraction massique, masse molaire kg/mol, {element: nb})
+    'SiO2':  (0.58, 0.060083, {'Si': 1, 'O': 2}),
+    'Al2O3': (0.22, 0.101961, {'Al': 2, 'O': 3}),
+    'Fe2O3': (0.08, 0.159688, {'Fe': 2, 'O': 3}),
+    'MgO':   (0.04, 0.040304, {'Mg': 1, 'O': 1}),
+    'K2O':   (0.04, 0.094196, {'K': 2, 'O': 1}),
+    'CaO':   (0.04, 0.056077, {'Ca': 1, 'O': 1}),
+}
+
+# --- Environnement ---
+T_EXTERIEUR = 273.15 + 150.0 # K, gres encaissant (thermostat)
+E_ARGILE    = 0.50           # m, epaisseur d'argile au-dessus et au-dessous
+# Distance a laquelle l'encaissant retrouve la temperature geothermique. Ce
+# n'est pas 2 m : une source de ~15 kW rechauffe la roche sur une dizaine de
+# metres (T - T_inf = Q / 4.pi.k.r). C'est ce parametre qui fixe la puissance
+# moyenne du reacteur, donc l'echelle de temps du cycle.
+E_GRES      = 4.00           # m, gres traverse avant le thermostat
+K_ARGILE    = 1.30           # W.m-1.K-1
+K_GRES      = 3.00           # W.m-1.K-1
+RHO_ARGILE  = 1700.0 * 0.9 + 997.0 * 0.1     # kg.m-3, argile saturee a 10 %
+CP_ARGILE   = 1350.0         # J.kg-1.K-1
+RHO_GRES, CP_GRES = 2400.0, 900.0
+K_CONGLO    = 0.30           # W.m-1.K-1, conglomerat lateral
+E_CONGLO    = 2.00           # m
+
+# --- Fuites : gain de reflecteur, PARAMETRE GEOMETRIQUE INCERTAIN ---
+# Un reflecteur epais d'argile humide "agrandit" le coeur vu par les neutrons.
+# Ordre de grandeur : la longueur de migration dans le reflecteur (0.2 - 1.0 m).
+REFLECTOR_SAVINGS = 0.62     # m
+
+# Surfaces d'echange
+A_AXIALE  = 2.0 * np.pi * R_COEUR**2          # 27.7 m2 (dessus + dessous)
+A_LATERALE = 2.0 * np.pi * R_COEUR * H_COEUR  #  9.24 m2
+
+
+def buckling_geometrique():
+    """Laplacien geometrique du cylindre elargi du gain de reflecteur (m^-2)."""
+    Re = R_COEUR + REFLECTOR_SAVINGS
+    He = H_COEUR + 2.0 * REFLECTOR_SAVINGS
+    return (2.405 / Re)**2 + (np.pi / He)**2
+
+
+def densites_atomiques_solides():
+    """Densites atomiques (m^-3 de coeur) des constituants solides, hors eau."""
+    N = {}
+    # --- uraninite ---
+    n_uo2 = FRAC_VOL_URANINITE * RHO_URANINITE / M_MOL_UO2 * N_A   # UO2 par m3
+    N['U235'] = ENRICHISSEMENT * n_uo2
+    N['U238'] = (1.0 - ENRICHISSEMENT) * n_uo2
+    N['O'] = 2.0 * n_uo2
+    # --- matrice ---
+    frac_vol_matrice = 1.0 - FRAC_VOL_URANINITE - POROSITE
+    masse_matrice = frac_vol_matrice * RHO_MATRICE                 # kg par m3 de coeur
+    for _, (w, M, elements) in OXYDES.items():
+        n_ox = w * masse_matrice / M * N_A
+        for el, nb in elements.items():
+            N[el] = N.get(el, 0.0) + nb * n_ox
+    return N
+
+
+N_SOLIDE = densites_atomiques_solides()
+
+# Masses (utiles pour la thermique et la source de fission spontanee)
+MASSE_UO2     = FRAC_VOL_URANINITE * RHO_URANINITE * V_COEUR
+MASSE_U       = MASSE_UO2 * FRAC_MASSE_U
+MASSE_U235    = MASSE_U * ENRICHISSEMENT
+MASSE_U238    = MASSE_U * (1.0 - ENRICHISSEMENT)
+MASSE_MATRICE = (1.0 - FRAC_VOL_URANINITE - POROSITE) * RHO_MATRICE * V_COEUR
+V_PORES       = POROSITE * V_COEUR
+
+# Source neutronique permanente (fissions spontanees) : neutrons par seconde
+SOURCE_NEUTRONS = (MASSE_U238 * 1e3 * TAUX_SF_U238
+                   + MASSE_U235 * 1e3 * TAUX_SF_U235) * NU_SF
+
+
+# ===========================================================================
+# 3. PROPRIETES DE L'EAU A 150 BAR
+# ===========================================================================
+
+P_HYDROSTATIQUE = 150.0e5    # Pa
+T_SAT   = 615.31             # K, temperature de saturation a 150 bar
+L_VAP   = 1.0005e6           # J.kg-1, chaleur latente a 150 bar
+RHO_VAP = 96.71              # kg.m-3, vapeur saturee a 150 bar
+
+T_CRIT, RHO_CRIT = 647.096, 322.0
+_B = (1.99274064, 1.09965342, -0.510839303, -1.75493479, -45.5170352, -6.74694450e5)
+_EXP = (1/3, 2/3, 5/3, 16/3, 43/3, 110/3)
+
+
+def rho_eau_liquide(T):
+    """Masse volumique de l'eau liquide (kg.m-3). Correlation IAPWS de la
+    ligne de saturation, valable jusqu'a T_SAT ; l'ecart a 150 bar sur le
+    liquide sous-refroidi est inferieur a 1 % (eau quasi incompressible)."""
+    T = min(T, T_SAT)
+    tau = 1.0 - T / T_CRIT
+    s = 1.0
+    for b, e in zip(_B, _EXP):
+        s += b * tau**e
+    return RHO_CRIT * s
+
+
+# Capacite thermique massique de l'eau a 150 bar (elle diverge pres de T_SAT)
+_T_CP  = np.array([423.15, 473.15, 523.15, 573.15, 593.15, 603.15, 610.0, T_SAT])
+_CP_EAU = np.array([4310.0, 4490.0, 4860.0, 5760.0, 6570.0, 7300.0, 8000.0, 8800.0])
+
+
+def cp_eau(T):
+    return float(np.interp(min(T, T_SAT), _T_CP, _CP_EAU))
+
+
+# ===========================================================================
+# 4. NEUTRONIQUE : FORMULE DES 6 FACTEURS A PARTIR DE LA COMPOSITION
+# ===========================================================================
+
+B2_GEO = buckling_geometrique()
+
+# Valeurs de reference de l'eau pure (pour normaliser l'age de Fermi)
+_N_H2O_REF = 1000.0 / 0.018015 * N_A          # molecules par m3
+_XI_SIGMA_S_REF = (2 * _N_H2O_REF * XI['H'] * DONNEES['H'][2] * BARN
+                   + _N_H2O_REF * XI['O'] * DONNEES['O'][2] * BARN)
+_SIGMA_S_REF = (2 * _N_H2O_REF * DONNEES['H'][2] * BARN
+                + _N_H2O_REF * DONNEES['O'][2] * BARN)
+TAU_EAU_PURE = 27.0e-4                        # m2, age de Fermi de l'eau legere
+
+
+def parametres_neutroniques(T_moderateur, T_combustible, masse_eau):
+    """Coeur du modele neutronique.
+
+    Renvoie k_eff, le temps de generation Lambda, la section efficace
+    macroscopique de fission et le detail des 6 facteurs.
+    Tout est calcule a partir des densites atomiques : aucun facteur ajuste.
+    """
+    # ---- densites atomiques de l'eau presente dans la porosite ----
+    n_h2o = (masse_eau / 0.018015) * N_A / V_COEUR      # molecules par m3 de coeur
+    N = dict(N_SOLIDE)
+    N['H'] = N.get('H', 0.0) + 2.0 * n_h2o
+    N['O'] = N.get('O', 0.0) + n_h2o
+
+    # ---- moyenne maxwellienne des sections efficaces (loi 1/v) ----
+    # sigma_moy(T) = sigma_2200 * (sqrt(pi)/2) * sqrt(T0/T)
+    fac_1v = (np.sqrt(np.pi) / 2.0) * np.sqrt(T_REF_NEUTRON / T_moderateur)
+    g_a = float(np.interp(T_moderateur, T_WESTCOTT, G_ABS_U235))
+    g_f = float(np.interp(T_moderateur, T_WESTCOTT, G_FIS_U235))
+
+    sigma_a_th, sigma_tr, xi_sigma_s, sigma_s = 0.0, 0.0, 0.0, 0.0
+    for el, n in N.items():
+        A, sa, ss, st = DONNEES[el]
+        g = g_a if el == 'U235' else 1.0
+        sigma_a_th += n * sa * BARN * fac_1v * g
+        sigma_tr   += n * st * BARN
+        xi_sigma_s += n * XI[el] * ss * BARN
+        sigma_s    += n * ss * BARN
+
+    sigma_a_u235 = N['U235'] * DONNEES['U235'][1] * BARN * fac_1v * g_a
+    sigma_a_u238 = N['U238'] * DONNEES['U238'][1] * BARN * fac_1v
+    sigma_f_u235 = N['U235'] * SIGMA_F_U235 * BARN * fac_1v * g_f
+    sigma_a_comb = sigma_a_u235 + sigma_a_u238
+
+    # ---- 1. eta : facteur de reproduction ----
+    eta = NU_BAR * sigma_f_u235 / sigma_a_comb
+
+    # ---- 2. f : facteur d'utilisation thermique ----
+    f = sigma_a_comb / sigma_a_th
+
+    # ---- 3. epsilon : facteur de fission rapide (constante, voir en-tete) ----
+    epsilon = EPSILON
+
+    # ---- 4. p : facteur antitrappe (resonances de l'U238) + Doppler ----
+    sigma_pot = sigma_s / N['U238']                       # m2 par atome d'U238
+    i_eff = 3.9 * (sigma_pot / BARN)**0.415 * BARN        # m2 (formule homogene)
+    i_eff *= 1.0 + BETA_DOPPLER * (np.sqrt(T_combustible)
+                                   - np.sqrt(T_REF_NEUTRON))
+    p = np.exp(-N['U238'] * i_eff / xi_sigma_s)
+
+    # ---- 5-6. probabilites de non-fuite ----
+    D = 1.0 / (3.0 * sigma_tr)                            # m
+    L2 = D / sigma_a_th                                   # m2, aire de diffusion
+    # age de Fermi : tau ~ 1/(Sigma_tr * xi*Sigma_s), normalise sur l'eau pure
+    tau = TAU_EAU_PURE * (_XI_SIGMA_S_REF / xi_sigma_s) * (_SIGMA_S_REF / sigma_s)
+    p_nl_rapide  = 1.0 / (1.0 + B2_GEO * tau)
+    p_nl_thermique = 1.0 / (1.0 + B2_GEO * L2)
+
+    k_eff = eta * epsilon * f * p * p_nl_thermique * p_nl_rapide
+
+    # ---- temps de generation ----
+    v_th = 2200.0 * np.sqrt(T_moderateur / T_REF_NEUTRON)          # m.s-1
+    # duree de ralentissement : ~1e-5 s dans l'eau legere pure, en 1/(xi.Sigma_s)
+    duree_thermalisation = 1.0e-5 * (_XI_SIGMA_S_REF / xi_sigma_s)
+    # duree de vie thermique : 1/(v * (absorption + fuite))
+    l_prompt = 1.0 / (v_th * (sigma_a_th + D * B2_GEO)) + duree_thermalisation
+    Lambda = l_prompt / max(k_eff, 1e-6)
+
+    detail = dict(eta=eta, epsilon=epsilon, f=f, p=p,
+                  pnl_th=p_nl_thermique, pnl_r=p_nl_rapide,
+                  L2=L2, tau=tau, sigma_a=sigma_a_th, sigma_f=sigma_f_u235,
+                  v_th=v_th)
+    return k_eff, Lambda, sigma_f_u235 * v_th, detail
+
+
+# ---------------------------------------------------------------------------
+# Etalonnage du gain de reflecteur sur la criticite marginale
+# ---------------------------------------------------------------------------
+# Deux arguments physiques imposent que k_eff soit tout juste inferieur a 1
+# lorsque le coeur est a la temperature d'ebullition, pores pleins :
+#
+#  (1) USURE DU COMBUSTIBLE. A ~15 kW la zone consomme ~5e14 noyaux d'U235 par
+#      seconde, soit 1 % de son stock en ~1500 ans. Une reactivite en exces de
+#      1 % serait donc devoree en quelques milliers d'annees, alors que RZ9 a
+#      fonctionne 150 000 ans : le reacteur a passe l'essentiel de sa vie a
+#      quelques 1e-3 de la criticite exacte.
+#  (2) AUTO-REGULATION PAR L'EAU. Si k_eff etait > 1 a 615 K, le coeur bouillirait
+#      et chasserait irreversiblement son eau jusqu'a repasser sous 1. L'etat
+#      k_eff(T_sat) legerement < 1 est donc un attracteur geologique.
+#
+# On resout donc, sur le seul parametre geometrique reellement inconnu (le gain
+# de reflecteur), l'equation k_eff(T_sat, pores pleins) = K_MARGINAL. De maniere
+# equivalente : le reacteur est exactement critique a T_CRITIQUE, quelques
+# kelvins sous l'ebullition (valeur affichee par diagnostic_parametres()).
+
+K_MARGINAL = 0.9950          # k_eff a 615 K, pores pleins  (0.99 < K < 1)
+
+
+def calibrer_reflecteur(k_cible=None, bornes=(0.05, 2.0)):
+    """Ajuste REFLECTOR_SAVINGS par dichotomie pour atteindre k_cible."""
+    global REFLECTOR_SAVINGS, B2_GEO
+    if k_cible is None:
+        k_cible = K_MARGINAL
+
+    def ecart(delta):
+        global REFLECTOR_SAVINGS, B2_GEO
+        REFLECTOR_SAVINGS = delta
+        B2_GEO = buckling_geometrique()
+        m_plein = rho_eau_liquide(T_SAT) * V_PORES
+        return parametres_neutroniques(T_SAT, T_SAT, m_plein)[0] - k_cible
+
+    a, b = bornes
+    if ecart(a) * ecart(b) > 0:
+        raise ValueError("k_eff = {:.4f} hors d'atteinte sur [{}, {}] m : "
+                         "la composition du coeur ne permet pas la criticite."
+                         .format(k_cible, a, b))
+    for _ in range(60):
+        c = 0.5 * (a + b)
+        if ecart(a) * ecart(c) <= 0:
+            b = c
+        else:
+            a = c
+    ecart(0.5 * (a + b))
+    return REFLECTOR_SAVINGS
+
+
+def coefficients_de_temperature():
+    """Coefficients de reactivite, en pcm par kelvin et par kg de vapeur."""
+    m_plein = rho_eau_liquide(T_SAT) * V_PORES
+    k0 = parametres_neutroniques(T_SAT, T_SAT, m_plein)[0]
+    dT = 2.0
+    m1 = rho_eau_liquide(T_SAT - dT) * V_PORES
+    k1 = parametres_neutroniques(T_SAT - dT, T_SAT - dT, m1)[0]
+    alpha_T = (k0 - k1) / dT / k0 * 1e5                      # pcm/K
+    dmv = 20.0
+    k2 = parametres_neutroniques(T_SAT, T_SAT,
+                                 m_plein - dmv * RAPPORT_CHASSE)[0]
+    alpha_v = (k2 - k0) / dmv / k0 * 1e5                     # pcm/kg de vapeur
+    return alpha_T, alpha_v
+
+
+# ===========================================================================
+# 5. THERMIQUE
+# ===========================================================================
+# --- 5a. Coeur : variable d'etat = enthalpie E (J) ---------------------------
+# E < E_SAT  : monophasique, T = T(E), pores pleins de liquide
+# E > E_SAT  : diphasique,   T = T_SAT, masse de vapeur m_v = (E - E_SAT)/L_VAP
+#
+# A volume de pore constant, creer 1 kg de vapeur chasse (rho_l/rho_v - 1) kg
+# de liquide vers la roche encaissante : l'inventaire d'eau chute vite.
+# -----------------------------------------------------------------------------
+
+T_REF_ENTHALPIE = 373.15     # K, origine arbitraire des enthalpies
+
+
+def _table_enthalpie():
+    """Table monotone E(T) du coeur (matrice + UO2 + eau liquide)."""
+    T = np.linspace(T_REF_ENTHALPIE, T_SAT, 2000)
+    C = np.empty_like(T)
+    for i, Ti in enumerate(T):
+        m_eau = rho_eau_liquide(Ti) * V_PORES
+        C[i] = (MASSE_MATRICE * CP_MATRICE
+                + MASSE_UO2 * CP_UO2
+                + m_eau * cp_eau(Ti))
+    E = np.concatenate(([0.0], np.cumsum(0.5 * (C[1:] + C[:-1]) * np.diff(T))))
+    return T, E, C
+
+
+T_TABLE, E_TABLE, C_TABLE = _table_enthalpie()
+E_SAT = E_TABLE[-1]
+RAPPORT_CHASSE = rho_eau_liquide(T_SAT) / RHO_VAP - 1.0   # ~5.2
+
+
+def etat_coeur(E):
+    """(temperature, masse de vapeur, masse d'eau A L'EQUILIBRE) a partir de E."""
+    if E < E_SAT:
+        T = float(np.interp(E, E_TABLE, T_TABLE))
+        return T, 0.0, rho_eau_liquide(T) * V_PORES
+    m_vap = (E - E_SAT) / L_VAP
+    m_eau = rho_eau_liquide(T_SAT) * V_PORES - m_vap * RAPPORT_CHASSE
+    return T_SAT, m_vap, max(m_eau, 0.0)
+
+
+# --- 5b. Relaxation hydraulique du fluide interstitiel -----------------------
+# La masse d'eau REELLEMENT presente dans les pores ne suit pas instantanement
+# la valeur thermodynamique : quand l'eau se dilate ou se vaporise, elle doit
+# etre chassee a travers la roche, et inversement lors du refroidissement.
+# C'est un ecoulement de Darcy, donc une diffusion de pression de constante
+#         tau_h = phi * mu * c_t * L^2 / k
+# avec mu = 8.6e-5 Pa.s (eau a 340 degC), c_t ~ 5e-9 Pa^-1 (compressibilite de
+# l'eau chaude + du squelette), L ~ 3.5 m (demi-largeur de la lentille) et k la
+# permeabilite intrinseque. Le minerai d'Oklo est un gres (les auteurs supposent
+# d'ailleurs les poisons neutroniques "laves" par la circulation d'eau, ce qui
+# suppose une bonne permeabilite) : k = 1e-14 a 1e-13 m2, soit 10 a 100 mD,
+# d'ou tau_h de quelques dizaines de secondes.
+#
+# CE RETARD EST LE MOTEUR DU CYCLE. Sans lui, la contre-reaction en densite
+# d'eau est instantanee, le reacteur s'auto-regule et l'oscillation s'amortit
+# en une dizaine de cycles (verifie numeriquement en prenant tau_h -> 0).
+# Avec lui, la boucle puissance -> temperature -> densite -> reactivite depasse
+# 180 degres de dephasage : l'etat stationnaire devient instable et le systeme
+# converge vers un CYCLE LIMITE, insensible aux conditions initiales.
+# ---------------------------------------------------------------------------
+
+PERMEABILITE = 3.0e-14       # m2 (30 mD), gres uranifere (PARAMETRE GEOLOGIQUE)
+MU_EAU       = 8.6e-5        # Pa.s a 340 degC
+COMPRESSIBILITE = 5.0e-9     # Pa^-1
+L_DRAINAGE   = 3.5           # m
+
+
+def temps_hydraulique():
+    return (POROSITE * MU_EAU * COMPRESSIBILITE * L_DRAINAGE**2) / PERMEABILITE
+
+
+def capacite_coeur(T):
+    return float(np.interp(T, T_TABLE, C_TABLE))
+
+
+# --- 5c. Argile et gres : conduction 1D transitoire ---------------------------
+# Indispensable : sur un cycle de 3 h la profondeur de penetration thermique
+# dans l'argile n'est que de ~8 cm. Un modele quasi permanent surestimerait
+# fortement l'evacuation de chaleur.
+# -----------------------------------------------------------------------------
+
+def maillage_1d(n_argile=18, n_gres=12):
+    """Maillage geometriquement raffine au contact du coeur."""
+    r = 1.32
+    dx = np.array([r**i for i in range(n_argile)], dtype=float)
+    dx *= E_ARGILE / dx.sum()
+    dxg = np.array([r**i for i in range(n_gres)], dtype=float)
+    dxg *= E_GRES / dxg.sum()
+    epaisseurs = np.concatenate([dx, dxg])
+    k = np.concatenate([np.full(n_argile, K_ARGILE), np.full(n_gres, K_GRES)])
+    rhocp = np.concatenate([np.full(n_argile, RHO_ARGILE * CP_ARGILE),
+                            np.full(n_gres, RHO_GRES * CP_GRES)])
+    return epaisseurs, k, rhocp
+
+
+DX, K_MAILLE, RHOCP_MAILLE = maillage_1d()
+N_MAILLES = len(DX)
+CAP_MAILLE = RHOCP_MAILLE * DX * A_AXIALE                # J.K-1 par maille
+
+# Conductances (W.K-1) : coeur -> maille 0, maille j -> j+1, derniere -> thermostat
+G_COEUR = A_AXIALE / (DX[0] / (2.0 * K_MAILLE[0]))
+G_INTER = np.array([A_AXIALE / (DX[j] / (2 * K_MAILLE[j])
+                                + DX[j + 1] / (2 * K_MAILLE[j + 1]))
+                    for j in range(N_MAILLES - 1)])
+G_FIN = A_AXIALE / (DX[-1] / (2.0 * K_MAILLE[-1]))
+# Voie laterale (conglomerat), traitee en regime quasi permanent : faible surface
+UA_LATERAL = K_CONGLO * A_LATERALE / E_CONGLO
+
+# Depot des gamma s'echappant du coeur (longueur d'attenuation ~ 0.20 m)
+_prof = np.cumsum(DX) - 0.5 * DX
+# maille situee a ~5 cm dans l'argile : c'est elle qui "respire" avec le cycle
+# (profondeur de penetration thermique sur 3 h : sqrt(a*t) ~ 8 cm)
+I_ARGILE_5CM = int(np.argmin(np.abs(_prof - 0.05)))
+_POIDS_GAMMA = np.exp(-_prof / 0.20) * DX
+_POIDS_GAMMA /= _POIDS_GAMMA.sum()
+
+
+def resoudre_argile(T_mailles, T_coeur, h, source):
+    """Un pas d'Euler implicite sur le maillage 1D (algorithme de Thomas)."""
+    n = N_MAILLES
+    a = np.zeros(n)   # sous-diagonale
+    b = np.zeros(n)   # diagonale
+    c = np.zeros(n)   # sur-diagonale
+    d = np.zeros(n)   # second membre
+
+    for j in range(n):
+        cap = CAP_MAILLE[j] / h
+        b[j] = cap
+        d[j] = cap * T_mailles[j] + source[j]
+        if j == 0:
+            b[j] += G_COEUR
+            d[j] += G_COEUR * T_coeur
+        else:
+            a[j] = -G_INTER[j - 1]
+            b[j] += G_INTER[j - 1]
+        if j < n - 1:
+            c[j] = -G_INTER[j]
+            b[j] += G_INTER[j]
+        else:
+            b[j] += G_FIN
+            d[j] += G_FIN * T_EXTERIEUR
+
+    # Thomas
+    for j in range(1, n):
+        m = a[j] / b[j - 1]
+        b[j] -= m * c[j - 1]
+        d[j] -= m * d[j - 1]
+    T = np.empty(n)
+    T[-1] = d[-1] / b[-1]
+    for j in range(n - 2, -1, -1):
+        T[j] = (d[j] - c[j] * T[j + 1]) / b[j]
+    return T
+
+
+# ===========================================================================
+# 6-7. CINETIQUE PONCTUELLE ET INTEGRATION A PAS ADAPTATIF
+# ===========================================================================
+# La cinetique est raide : Lambda ~ 3e-4 s alors que le cycle dure ~1e4 s.
+# Un schema d'Euler implicite serait stable mais DISSIPATIF : il amortirait
+# artificiellement l'oscillation que l'on cherche justement a observer.
+# Comme le systeme (n, C_1..C_6) est LINEAIRE a reactivite figee, on l'integre
+# exactement sur le pas par exponentielle de matrice :
+#         y' = A y + b   ->   y(h) = e^{Ah} y0 + A^{-1}(e^{Ah}-I) b
+# calculee par diagonalisation (les 7 racines de l'equation inhour sont
+# reelles). Aucun amortissement numerique n'est introduit.
+# ===========================================================================
+
+_A_KIN = np.zeros((7, 7))
+_A_KIN[0, 1:] = LAMBDA_I
+_A_KIN[1:, 1:] = np.diag(-LAMBDA_I)
+_B_KIN = np.zeros(7)
+_CACHE = {'rho': None, 'Lambda': None}
+
+
+def _diagonaliser(rho, Lambda):
+    """Diagonalise la matrice de cinetique (mise en cache : la reactivite
+    varie tres lentement pendant les phases calmes)."""
+    if (_CACHE['rho'] is not None
+            and abs(rho - _CACHE['rho']) < 1e-7
+            and abs(Lambda - _CACHE['Lambda']) < 1e-8):
+        return _CACHE['w'], _CACHE['V'], _CACHE['s']
+    A = _A_KIN.copy()
+    A[0, 0] = (rho - BETA) / Lambda
+    A[1:, 0] = BETA_I / Lambda
+    b = _B_KIN.copy()
+    b[0] = SOURCE_NEUTRONS
+    w, V = np.linalg.eig(A)
+    s = np.linalg.solve(V, b)
+    _CACHE.update(rho=rho, Lambda=Lambda, w=w, V=V, s=s)
+    return w, V, s
+
+
+def pas_cinetique(n, C, rho, Lambda, h):
+    """Avance exactement (n, C) d'un pas h a reactivite figee."""
+    w, V, s = _diagonaliser(rho, Lambda)
+    y0 = np.empty(7)
+    y0[0], y0[1:] = n, C
+    z = np.linalg.solve(V, y0)          # composantes propres de l'etat
+    wh = w * h
+    exp_wh = np.exp(np.clip(wh.real, -700.0, 700.0) + 1j * wh.imag)
+    # phi = (e^{wh} - 1)/w, prolonge par continuite en w = 0
+    petit = np.abs(wh) < 1e-8
+    phi = np.where(petit, h * (1.0 + 0.5 * wh),
+                   (exp_wh - 1.0) / np.where(petit, 1.0, w))
+    y = (V @ (exp_wh * z + phi * s)).real
+
+    n_new = y[0]
+    C_new = np.maximum(y[1:], 0.0)
+    if not np.isfinite(n_new) or n_new <= 0.0:
+        n_new = max(SOURCE_NEUTRONS * Lambda / max(BETA - rho, 1e-6), 1e-30)
+    return n_new, C_new
+
+
+def profil_argile_permanent(T_coeur):
+    """Profil de temperature etabli dans l'argile puis le gres (regime permanent)."""
+    R_cum = 0.5 * DX[0] / K_MAILLE[0]
+    resistances = []
+    for j in range(N_MAILLES):
+        if j > 0:
+            R_cum += 0.5 * DX[j - 1] / K_MAILLE[j - 1] + 0.5 * DX[j] / K_MAILLE[j]
+        resistances.append(R_cum)
+    R_tot = R_cum + 0.5 * DX[-1] / K_MAILLE[-1]
+    r = np.array(resistances) / R_tot
+    return T_coeur + (T_EXTERIEUR - T_coeur) * r
+
+
+def simuler(duree=24 * 3600.0, tol=6e-3, h_max=20.0, dt_enreg=3.0, verbose=True):
+    """Integre le modele complet. Renvoie un dictionnaire de resultats."""
+
+    # ---------------- conditions initiales ----------------
+    # Coeur juste sous la saturation, pores pleins, profil thermique etabli :
+    # on se place d'emblee dans le regime permanent cyclique, sans simuler les
+    # ~6 jours de montee en temperature initiale.
+    T0 = T_SAT - 3.0
+    E = float(np.interp(T0, T_TABLE, E_TABLE))
+    T_coeur, m_vap, m_eq = etat_coeur(E)
+    m_mod = m_eq                      # eau reellement presente dans les pores
+    tau_h = temps_hydraulique()
+    T_mailles = profil_argile_permanent(T_coeur)
+
+    k_eff, Lambda, sigma_f_v, _ = parametres_neutroniques(T_coeur, T_coeur, m_mod)
+    rho_reac = (k_eff - 1.0) / k_eff
+    n = SOURCE_NEUTRONS * Lambda / max(abs(rho_reac), 1e-4)
+    C = BETA_I * n / (Lambda * LAMBDA_I)
+    # produits de fission : equilibre correspondant a la puissance initiale
+    P_fis = n * sigma_f_v * EPSILON * E_FISS_TOT
+    H = GAMMA_DEC_I * P_fis / LAMBDA_DEC
+
+    t, h = 0.0, 1e-3
+    res = {clef: [] for clef in
+           ('t', 'P', 'k', 'T', 'm_eau', 'm_vap', 'Q', 'T_argile')}
+    t_enreg, n_pas, n_rejets = -1e9, 0, 0
+    debut = perf_counter()
+
+    while t < duree:
+        T_coeur, m_vap, m_eq = etat_coeur(E)
+        k_eff, Lambda, sigma_f_v, _ = parametres_neutroniques(T_coeur, T_coeur, m_mod)
+        rho_reac = (k_eff - 1.0) / k_eff
+        P_fis = n * sigma_f_v * EPSILON * E_FISS_TOT          # energie liberee par fission
+        P_dep = (1.0 - GAMMA_DEC) * P_fis + float(LAMBDA_DEC @ H)   # energie deposee
+        flux = (G_COEUR * (T_coeur - T_mailles[0])
+                + UA_LATERAL * (T_coeur - T_EXTERIEUR))
+
+        # ---- bornes sur le pas ----
+        # La cinetique etant integree exactement, le pas n'est limite que par
+        # la vitesse a laquelle la REACTIVITE (donc l'etat thermique) evolue.
+        h = min(h_max, h)
+        dEdt = abs(P_dep * E_FISS_COEUR / E_FISS_TOT - flux) + 1.0
+        if m_vap > 1e-9:
+            h = min(h, 2.0 * L_VAP / dEdt)                   # <= 2 kg de vapeur
+        else:
+            h = min(h, 0.02 * capacite_coeur(T_coeur) / dEdt)  # <= 0.02 K
+        h = max(h, 1e-6)
+        if t + h > duree:
+            h = duree - t
+
+        # ---- avance couplee (predicteur-correcteur) ----
+        # Le coeur et l'argile sont resolus DANS la meme boucle, et le flux
+        # utilise pour le bilan du coeur est exactement celui que le schema
+        # implicite depose dans l'argile : l'echange est alors conservatif, ce
+        # qui supprime l'erreur d'ordre 1 du couplage (verifie en raffinant
+        # h_max, voir la fonction convergence_en_pas()).
+        decroissance = np.exp(-LAMBDA_DEC * h)
+        relax = np.exp(-h / tau_h)
+        n_new, C_new = pas_cinetique(n, C, rho_reac, Lambda, h)
+        rho_n, H_new, P_dep_moy, m_mod_new = rho_reac, H, P_dep, m_mod
+        T_n, T_mailles_new = T_coeur, T_mailles
+        for _ in range(2):
+            P_fis_moy = 0.5 * (n + n_new) * sigma_f_v * EPSILON * E_FISS_TOT
+            # produits de fission : integration exacte a source de fission figee
+            H_new = (H * decroissance
+                     + (GAMMA_DEC_I * P_fis_moy / LAMBDA_DEC) * (1.0 - decroissance))
+            P_dep_moy = ((1.0 - GAMMA_DEC) * P_fis_moy
+                         + 0.5 * float(LAMBDA_DEC @ (H + H_new)))
+            # --- argile : schema implicite, pilote par la temperature moyenne
+            T_coeur_moy = 0.5 * (T_coeur + T_n)
+            source = _POIDS_GAMMA * (P_dep_moy * E_FISS_EXT / E_FISS_TOT)
+            T_mailles_new = resoudre_argile(T_mailles, T_coeur_moy, h, source)
+            # --- flux reellement depose dans l'argile = flux retire au coeur
+            flux = (G_COEUR * (T_coeur_moy - T_mailles_new[0])
+                    + UA_LATERAL * (T_coeur_moy - T_EXTERIEUR))
+            # --- enthalpie du coeur
+            E_new = max(E + h * (P_dep_moy * E_FISS_COEUR / E_FISS_TOT - flux), 0.0)
+            T_n, _, m_eq_new = etat_coeur(E_new)
+            # --- relaxation hydraulique vers la teneur en eau d'equilibre
+            m_eq_moy = 0.5 * (m_eq + m_eq_new)
+            m_mod_new = m_eq_moy + (m_mod - m_eq_moy) * relax
+            k_n, Lam_n, _, _ = parametres_neutroniques(T_n, T_n, m_mod_new)
+            rho_n = (k_n - 1.0) / k_n
+            n_new, C_new = pas_cinetique(n, C, 0.5 * (rho_reac + rho_n),
+                                         0.5 * (Lambda + Lam_n), h)
+
+        # ---- controle d'erreur : variation de reactivite sur le pas ----
+        err = max(abs(rho_n - rho_reac) / (tol * BETA),
+                  abs(np.log(max(n_new, 1e-300) / max(n, 1e-300))) / 0.7)
+        if err > 1.0 and h > 2e-6:
+            h *= max(0.2, 0.8 / err)
+            n_rejets += 1
+            continue
+
+        T_mailles = T_mailles_new
+        n, C, E, H, m_mod, t = n_new, C_new, E_new, H_new, m_mod_new, t + h
+        n_pas += 1
+        h *= min(1.5, max(0.7, 0.8 / max(err, 0.4)))
+
+        # ---- enregistrement ----
+        if t - t_enreg > dt_enreg:
+            T_coeur, m_vap, _ = etat_coeur(E)
+            k_eff, _, sfv, _ = parametres_neutroniques(T_coeur, T_coeur, m_mod)
+            res['t'].append(t)
+            res['P'].append((1.0 - GAMMA_DEC) * n * sfv * EPSILON * E_FISS_TOT
+                            + float(LAMBDA_DEC @ H))
+            res['k'].append(k_eff)
+            res['T'].append(T_coeur)
+            res['m_eau'].append(m_mod)
+            res['m_vap'].append(m_vap)
+            res['Q'].append(G_COEUR * (T_coeur - T_mailles[0])
+                            + UA_LATERAL * (T_coeur - T_EXTERIEUR))
+            res['T_argile'].append(T_mailles[I_ARGILE_5CM])
+            t_enreg = t
+
+    if verbose:
+        print("  {} pas ({} rejets) en {:.1f} s de calcul"
+              .format(n_pas, n_rejets, perf_counter() - debut))
+    for clef in res:
+        res[clef] = np.array(res[clef])
+    return res
+
+
+# ===========================================================================
+# 8. DIAGNOSTIC DES CYCLES ET AFFICHAGE
+# ===========================================================================
+
+def analyser_cycles(res):
+    """Decoupe la chronique en cycles.
+
+    Le reacteur est declare EN MARCHE quand la puissance de fission depasse la
+    puissance evacuee vers l'encaissant : c'est le critere physique (le coeur
+    se rechauffe et vaporise), et non un seuil arbitraire.
+    """
+    P, Q, t = res['P'], res['Q'], res['t']
+    actif = P > Q
+    fronts = np.diff(actif.astype(int))
+    debuts, fins = t[1:][fronts == 1], t[1:][fronts == -1]
+    marches, arrets, periodes = [], [], []
+    for d in debuts:
+        f = fins[fins > d]
+        if len(f) == 0:
+            break
+        suivants = debuts[debuts > f[0]]
+        if len(suivants) == 0:
+            break
+        marches.append(f[0] - d)
+        arrets.append(suivants[0] - f[0])
+        periodes.append(suivants[0] - d)
+    return np.array(marches), np.array(arrets), np.array(periodes)
+
+
+def bilan_energetique(res):
+    """(fraction des fissions produites en phase de marche, puissance moyenne)."""
+    P, Q, t = res['P'], res['Q'], res['t']
+    if len(t) < 2:
+        return 0.0, 0.0
+    dt = np.gradient(t)
+    total = float(np.sum(P * dt))
+    pendant = float(np.sum(P[P > Q] * dt[P > Q]))
+    return (pendant / total if total else 0.0), total / (t[-1] - t[0])
+
+
+def diagnostic_parametres():
+    """Affiche le bilan du modele : geometrie, inventaire, k_eff dans
+    quatre etats de reference, coefficients de contre-reaction."""
+    print("=" * 74)
+    print("  REACTEUR NATUREL RZ9 D'OKLO  -  bilan du modele")
+    print("=" * 74)
+    print("Geometrie   : cylindre R = {:.2f} m, H = {:.2f} m, V = {:.2f} m3"
+          .format(R_COEUR, H_COEUR, V_COEUR))
+    print("Combustible : {:.0f} kg d'UO2, {:.0f} kg d'U dont {:.1f} kg d'U235"
+          .format(MASSE_UO2, MASSE_U, MASSE_U235))
+    print("Porosite    : {:.0f} %  ->  {:.0f} kg d'eau a saturation"
+          .format(POROSITE * 100, rho_eau_liquide(T_SAT) * V_PORES))
+    print("Source      : {:.2e} neutrons/s (fission spontanee de l'U238)"
+          .format(SOURCE_NEUTRONS))
+    print("B2 geo      : {:.3f} m-2  (gain de reflecteur {:.2f} m)"
+          .format(B2_GEO, REFLECTOR_SAVINGS))
+    print("-" * 74)
+    m_plein = rho_eau_liquide(T_SAT) * V_PORES
+    for nom, T, m in (("pores pleins  (T = 615 K)", T_SAT, m_plein),
+                      ("10 % d'eau en moins      ", T_SAT, 0.90 * m_plein),
+                      ("30 % d'eau en moins      ", T_SAT, 0.70 * m_plein),
+                      ("coeur froid   (T = 423 K)", T_EXTERIEUR,
+                       rho_eau_liquide(T_EXTERIEUR) * V_PORES)):
+        k, Lam, _, d = parametres_neutroniques(T, T, m)
+        print("{}  k_eff = {:.4f}   (eta={:.3f} f={:.3f} p={:.3f} "
+              "Pnl_th={:.3f} Pnl_r={:.3f})  Lambda={:.2e}s"
+              .format(nom, k, d['eta'], d['f'], d['p'], d['pnl_th'], d['pnl_r'], Lam))
+    print("-" * 74)
+    a_T, a_v = coefficients_de_temperature()
+    # temperature a laquelle le reacteur est exactement critique
+    T_c = T_SAT + (1.0 - K_MARGINAL) / (a_T * 1e-5)
+    print("Coefficient de temperature   : {:+.0f} pcm/K  (densite de l'eau)"
+          .format(a_T))
+    print("Coefficient de vide          : {:+.1f} pcm par kg de vapeur"
+          .format(a_v))
+    print("Criticite exacte atteinte a  : {:.1f} K = {:.1f} degC "
+          "({:.1f} K sous l'ebullition)".format(T_c, T_c - 273.15, T_SAT - T_c))
+    print("Capacite thermique du coeur  : {:.2e} J/K".format(capacite_coeur(600.0)))
+    print("1 kg de vapeur chasse {:.2f} kg de liquide des pores"
+          .format(RAPPORT_CHASSE))
+    print("Retard hydraulique tau_h     : {:.0f} s  (permeabilite {:.0e} m2)"
+          .format(temps_hydraulique(), PERMEABILITE))
+    print("Puissance residuelle         : {:.1f} % de l'energie de fission, "
+          "liberee avec retard".format(100 * GAMMA_DEC))
+    print("=" * 74)
+
+
+def resume(res, marches, arrets, periodes):
+    """Compare le regime obtenu aux observations d'Oklo."""
+    frac, P_moy = bilan_energetique(res)
+    n_der = max(1, len(marches) // 3)          # cycles etablis (dernier tiers)
+    print("\n" + "=" * 74)
+    print("  REGIME CYCLIQUE OBTENU        |     simulation    |     Oklo (RZ9)")
+    print("-" * 74)
+    if len(marches) >= 2:
+        print("  duree de marche              |   {:6.1f} min     |     ~30 min"
+              .format(marches[-n_der:].mean() / 60))
+        print("  duree d'arret                |   {:6.1f} min     |     ~150 min"
+              .format(arrets[-n_der:].mean() / 60))
+        print("  periode                      |   {:6.1f} min     |     ~180 min"
+              .format(periodes[-n_der:].mean() / 60))
+        print("  rapport arret/marche         |   {:6.2f}         |      5.0"
+              .format(arrets[-n_der:].mean() / marches[-n_der:].mean()))
+        print("  dispersion sur les 5 derniers|   {:6.2f} min (marche)"
+              .format(marches[-5:].std() / 60))
+    else:
+        print("  AUCUN CYCLE : le reacteur est eteint ou en regime permanent.")
+    print("-" * 74)
+    print("  puissance moyenne            |   {:6.1f} kW      |   6 a 100 kW"
+          .format(P_moy / 1e3))
+    print("  puissance de pointe          |   {:6.1f} kW".format(res['P'].max() / 1e3))
+    # NB : 100 kW pour l'ensemble des 16 zones -> ~1e17 fissions/min au total,
+    # soit ~1e16 pour RZ9 seule (et non 1e15 : erreur d'un facteur 10 a corriger
+    # dans le compte rendu).
+    print("  fissions par minute          |   {:.2e}    |     ~1e16"
+          .format(P_moy * 60 / E_FISS_TOT))
+    print("  part des fissions en marche  |   {:6.1f} %".format(100 * frac))
+    print("  temperature du coeur         |   {:.1f} a {:.1f} K  (ebullition {:.1f} K)"
+          .format(res['T'].min(), res['T'].max(), T_SAT))
+    print("=" * 74)
+
+
+def etude_sensibilite(duree=30 * 3600.0):
+    """Balaye les quatre parametres geologiques inconnus et mesure le cycle.
+
+    C'est la reponse a la question "le resultat est-il un reglage ?" : le cycle
+    existe sur toute une plage de valeurs, seules ses durees se deplacent, et
+    aucune duree n'est jamais fournie en entree.
+    """
+    global PERMEABILITE, K_MARGINAL
+    perm0, k0 = PERMEABILITE, K_MARGINAL
+    print("\n" + "=" * 74)
+    print("  SENSIBILITE AUX PARAMETRES GEOLOGIQUES")
+    print("=" * 74)
+    print("  {:<34s} {:>10s} {:>10s} {:>10s}"
+          .format("parametre", "marche", "arret", "P moyenne"))
+    print("-" * 74)
+    for nom, attribut, valeurs in (
+            ("permeabilite k (m2)", 'PERMEABILITE',
+             (1e-13, 6e-14, 3e-14, 1e-14)),
+            ("k_eff a 615 K, pores pleins", 'K_MARGINAL',
+             (0.999, 0.997, 0.995, 0.993))):
+        for v in valeurs:
+            globals()[attribut] = v
+            try:
+                calibrer_reflecteur(K_MARGINAL)
+            except ValueError:
+                print("  {:<34s} {:>10s}".format("%s = %.3g" % (nom, v),
+                                                 "sous-critique"))
+                continue
+            res = simuler(duree=duree, verbose=False)
+            ma, ar, _ = analyser_cycles(res)
+            _, P_moy = bilan_energetique(res)
+            if len(ma) < 2:
+                print("  {:<34s} {:>32s}".format("%s = %.3g" % (nom, v),
+                                                 "pas de cycle"))
+            else:
+                print("  {:<34s} {:>7.0f} min {:>6.0f} min {:>8.1f} kW"
+                      .format("%s = %.3g" % (nom, v),
+                              ma[-1] / 60, ar[-1] / 60, P_moy / 1e3))
+        globals()[attribut] = {'PERMEABILITE': perm0, 'K_MARGINAL': k0}[attribut]
+    PERMEABILITE, K_MARGINAL = perm0, k0
+    calibrer_reflecteur(K_MARGINAL)
+    print("=" * 74)
+
+
+def tracer(res, marches, arrets):
+    heures = res['t'] / 3600.0
+    fig, ax = plt.subplots(3, 2, figsize=(13.5, 9))
+    fig.suptitle("Reacteur naturel RZ9 d'Oklo : cycle limite auto-entretenu "
+                 "(marche {:.0f} min / arret {:.0f} min)"
+                 .format(marches[-1] / 60 if len(marches) else 0,
+                         arrets[-1] / 60 if len(arrets) else 0))
+
+    ax[0, 0].semilogy(heures, np.maximum(res['P'], 1e-6), lw=0.9)
+    ax[0, 0].semilogy(heures, np.maximum(res['Q'], 1e-6), 'r--', lw=0.8,
+                      label="evacue par conduction")
+    ax[0, 0].set_ylabel('Puissance (W)')
+    ax[0, 0].set_title("la puissance balaie plusieurs decades a chaque cycle",
+                       fontsize=9)
+    ax[0, 0].legend(fontsize=8)
+
+    ax[0, 1].plot(heures, res['P'] / 1e3, lw=0.9)
+    ax[0, 1].set_ylabel('Puissance (kW)')
+    ax[0, 1].set_title("meme chose en echelle lineaire", fontsize=9)
+
+    ax[1, 0].plot(heures, res['k'], lw=0.9)
+    ax[1, 0].axhline(1.0, color='r', ls='--', lw=0.8)
+    ax[1, 0].set_ylabel(r'$k_{eff}$')
+
+    ax[1, 1].plot(heures, res['m_eau'], lw=0.9)
+    ax[1, 1].set_ylabel("Eau dans les pores (kg)")
+    ax[1, 1].set_title("le moderateur est chasse puis revient", fontsize=9)
+
+    ax[2, 0].plot(heures, res['T'], lw=0.9, label='coeur')
+    ax[2, 0].plot(heures, res['T_argile'], lw=0.9, label='argile a 5 cm')
+    ax[2, 0].axhline(T_SAT, color='r', ls='--', lw=0.8, label='ebullition')
+    ax[2, 0].set_ylabel('Temperature (K)')
+    ax[2, 0].set_title("le cycle ne fait osciller le coeur que de ~1 K",
+                       fontsize=9)
+    ax[2, 0].legend(fontsize=8)
+
+    # portrait de phase : la signature d'un cycle limite
+    n0 = len(heures) // 3
+    ax[2, 1].plot(res['m_eau'][n0:], np.log10(np.maximum(res['P'][n0:], 1e-6)),
+                  lw=0.7)
+    ax[2, 1].set_xlabel("Eau dans les pores (kg)")
+    ax[2, 1].set_ylabel(r'$\log_{10}$ P (W)')
+    ax[2, 1].set_title("portrait de phase (cycle limite)", fontsize=9)
+
+    for a in ax.flat[:5]:
+        a.set_xlabel('Temps (h)')
+    for a in ax.flat:
+        a.grid(alpha=0.3)
+    fig.tight_layout()
+
+    tracer_un_cycle(res, marches, arrets)
+    plt.show()
+
+
+def tracer_un_cycle(res, marches, arrets):
+    """Zoom sur le dernier cycle etabli : c'est la figure a montrer au jury."""
+    if len(marches) < 2:
+        return
+    P, Q, t = res['P'], res['Q'], res['t']
+    fronts = np.diff((P > Q).astype(int))
+    debuts = t[1:][fronts == 1]
+    if len(debuts) < 3:
+        return
+    t0 = debuts[-2] - 0.25 * arrets[-1]
+    t1 = debuts[-1] + 0.15 * arrets[-1]
+    s = (t >= t0) & (t <= t1)
+    minutes = (t[s] - debuts[-2]) / 60.0
+
+    fig, ax = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    fig.suptitle("Un cycle : {:.0f} min de marche puis {:.0f} min d'arret"
+                 .format(marches[-1] / 60, arrets[-1] / 60))
+    ax[0].semilogy(minutes, np.maximum(P[s], 1e-3), lw=1.2)
+    ax[0].semilogy(minutes, np.maximum(Q[s], 1e-3), 'r--', lw=0.9,
+                   label='puissance evacuee')
+    ax[0].fill_between(minutes, 1e-3, 1e7, where=P[s] > Q[s],
+                       color='orange', alpha=0.18, label='marche')
+    ax[0].set_ylim(1e0, 1e6)
+    ax[0].set_ylabel('Puissance (W)')
+    ax[0].legend(fontsize=8)
+
+    ax[1].plot(minutes, res['k'][s], lw=1.2)
+    ax[1].axhline(1.0, color='r', ls='--', lw=0.9)
+    ax[1].set_ylabel(r'$k_{eff}$')
+
+    ax[2].plot(minutes, res['m_eau'][s], lw=1.2)
+    ax[2].set_ylabel("Eau dans les pores (kg)")
+    ax[2].set_xlabel("Temps depuis le debut de la marche (min)")
+    for a in ax:
+        a.grid(alpha=0.3)
+    fig.tight_layout()
+
+
+def convergence_en_pas(duree=40 * 3600.0, pas=(20.0, 5.0, 1.25)):
+    """Verifie que le resultat ne depend pas du pas de temps.
+
+    C'est le controle numerique indispensable : une oscillation obtenue par un
+    schema dissipatif ou mal converge n'a aucune valeur physique. On divise
+    h_max par 4 deux fois de suite et on verifie que les durees du cycle ne
+    bougent plus.
+    """
+    print("\n" + "=" * 74)
+    print("  CONVERGENCE EN PAS DE TEMPS")
+    print("=" * 74)
+    print("  {:>8s} {:>9s} {:>10s} {:>10s} {:>12s}"
+          .format("h_max (s)", "pas", "marche", "arret", "P moyenne"))
+    print("-" * 74)
+    for h in pas:
+        res = simuler(duree=duree, h_max=h, verbose=False)
+        ma, ar, _ = analyser_cycles(res)
+        _, P_moy = bilan_energetique(res)
+        if len(ma) < 2:
+            print("  {:>8.2f}  pas de cycle".format(h))
+            continue
+        print("  {:>8.2f} {:>9d} {:>7.2f} min {:>6.2f} min {:>9.2f} kW"
+              .format(h, len(res['t']), ma[-1] / 60, ar[-1] / 60, P_moy / 1e3))
+    print("=" * 74)
+
+
+def validation_cinetique(rho=1.0e-3, Lambda=3.0e-4):
+    """Compare l'integrateur a la solution exacte de l'equation inhour.
+
+    A reactivite constante, la population neutronique tend vers exp(t/T) ou T
+    est la periode stable, racine de   rho = w.Lambda + somme(beta_i.w/(w+lam_i)).
+    On verifie aussi qu'un seul grand pas donne le meme resultat que mille
+    petits : c'est la signature d'une integration exacte.
+    """
+    global SOURCE_NEUTRONS
+    source0 = SOURCE_NEUTRONS
+    SOURCE_NEUTRONS = 0.0                      # on isole la cinetique
+    lo, hi = 1e-8, 1e4
+    for _ in range(200):                       # dichotomie sur l'equation inhour
+        w = 0.5 * (lo + hi)
+        if w * Lambda + np.sum(BETA_I * w / (w + LAMBDA_I)) < rho:
+            lo = w
+        else:
+            hi = w
+    periode_exacte = 1.0 / lo
+
+    n, C = 1.0, BETA_I / (Lambda * LAMBDA_I)
+    for _ in range(300):                       # on atteint le regime asymptotique
+        n, C = pas_cinetique(n, C, rho, Lambda, 1.0)
+    n1, C1 = n, C.copy()
+    for _ in range(100):
+        n, C = pas_cinetique(n, C, rho, Lambda, 1.0)
+    periode_100pas = 100.0 / np.log(n / n1)
+    n2, _ = pas_cinetique(n1, C1, rho, Lambda, 100.0)
+    periode_1pas = 100.0 / np.log(n2 / n1)
+    SOURCE_NEUTRONS = source0
+
+    print("\n" + "=" * 74)
+    print("  VALIDATION DE L'INTEGRATEUR DE CINETIQUE  (rho = {:.0e})".format(rho))
+    print("-" * 74)
+    print("  periode stable, equation inhour  : {:.4f} s".format(periode_exacte))
+    print("  periode stable, 100 pas de 1 s   : {:.4f} s".format(periode_100pas))
+    print("  periode stable, 1 pas de 100 s   : {:.4f} s".format(periode_1pas))
+    print("  -> ecart relatif : {:.1e}"
+          .format(abs(periode_100pas - periode_exacte) / periode_exacte))
+    print("=" * 74)
+
+
+if __name__ == '__main__':
+    calibrer_reflecteur()
+    diagnostic_parametres()
+    resultats = simuler(duree=60 * 3600.0)
+    marches, arrets, periodes = analyser_cycles(resultats)
+    resume(resultats, marches, arrets, periodes)
+    tracer(resultats, marches, arrets)
+    # Decommenter pour l'etude de sensibilite (~2 min de calcul) :
+    # etude_sensibilite()
+
+
+#Sa fait 
