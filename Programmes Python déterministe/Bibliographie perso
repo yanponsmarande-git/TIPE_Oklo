@@ -1,0 +1,27 @@
+Ingénierie nucléaire :
+https://www.engr.psu.edu/conedmat/courses/nuce497a/lamarsh_baratta-introduction_to_nuclear_engineering_textbook_3rd_edition.pdf [2]
+- Voir chapitre 5 et 6 pour la relation entre les 3 taux (absorption,fuite et génération) en fonction de la taille et composition du réacteur.
+- Modération et contrôle : page 230
+
+Données :
+(https://archive.wikiwix.com/cache/display2.php?url=http%3A%2F%2Fwww.andrewkaram.com%2Fpdf%2FOklo%2520reactor.pdf) Ne fonctionne plus.
+(https://archive.wikiwix.com/cache/display2.php?url=https%3A%2F%2Fwww.iaea.org%2Fsites%2Fdefault%2Ffiles%2F17105192224_fr.pdf) Ne fonctionne plus.
+- détaillé et complet à propose des données de R9 d'Oklo : https://www.academie-sciences.fr/pdf/cr/CRGeo_article.pdf [1]
+- compliqué pas encore vu : https://www.researchgate.net/publication/8195734_Record_of_Cycling_Operation_of_the_Natural_Nuclear_Reactor_in_the_OkloOkelobondo_Area_in_Gabon 
+- Conductivité thermique de roches, conglomérats et argiles :
+https://pubs.usgs.gov/of/1988/0441/report.pdf 
+- Conduct et capacité thermique de UO2 : 
+https://theses.hal.science/tel-03145769/file/THESIS_VIDAL.pdf 
+- Densité de l’eau liquide fonction de la température:
+https://powderprocess.net/Tools_html/Data_Diagrams/Water_Properties_Correlations.html 
+- Effet doppler nucléaire de U235 en fonction de la température
+https://www.osti.gov/etdeweb/servlets/purl/20956282  
+
+A propos des différences de simulations : 
+- Informatique dans le nucléaire : 
+https://www.asn.fr/content/download/98374/file/131.pdf 
+- Codes nucléaires :
+https://www.cea.fr/Documents/monographies/La%20neutronique%20-%20Les%20codes.pdf 
+
+
+Voir les références ([1] et [2]) dans "Compte-rendu programme perso"
