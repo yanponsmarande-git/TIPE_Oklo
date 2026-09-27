@@ -1,1 +1,28 @@
-Ici le compte rendu
+Données de modélisations : 
+LES MATÉRIAUX
+Le code python materiaux.py génère le fichier materials.xml qui défini les matériaux de la modélisation : uranium 235 pur à densité 0.016351 g.cm-3. 
+réflecteurs latéraux (conglomérats) poreux à 15% d’eau de densité 2.4025 g.cm-3, réflecteurs axiaux (argile kaolinite) poreux à 10% d’eau de densité 2.44 g.cm-3.
+
+LA GÉOMÉTRIE
+Dans OpenMC, on construit la géométrie en trois niveaux : les surfaces (plans, cylindres, sphères...), les cellules (volumes délimités par ces surfaces), et l'univers qui contient tout.
+De même, le code geometrie.py génère le fichier geometry.xml qui définit la géométrie et le repère du modèle : cylindre de rayon 210 cm et hauteur 70 cm centré en 0.
+
+LA PARAMÉTRISATION
+Les cycles inactifs (50) servent à laisser la distribution spatiale des neutrons converger vers sa forme naturelle avant de commencer à mesurer le k-effectif. Si on les ignore, les premiers cycles sont biaisés 
+par notre source initiale arbitraire.
+Les 10 000 neutrons par cycle donnent un bon compromis précision/temps de calcul. Avec 100 cycles actifs, on aura une statistique solide avec un écart-type sur k-eff de l'ordre de ±0.001.
+OpenMC fait un calcul de criticité statique — il ne simule pas le démarrage dynamique du réacteur, il cherche directement l'état stationnaire en calculant k-eff. La source initiale qu'on définit n'est 
+qu'un point de départ mathématique pour l'algorithme, pas une modélisation physique de la source réelle. Les cycles inactifs servent précisément à faire oublier au code ce point de départ artificiel.
+
+LES TALLIES
+En neutronique Monte Carlo, un tally est un compteur statistique. Pendant la simulation, OpenMC suit des millions de neutrons individuellement. À chaque fois qu'un neutron traverse une région ou subit une interaction, 
+OpenMC peut enregistrer une quantité physique d'intérêt. À la fin de la simulation, il fait la moyenne sur tous les neutrons et tous les cycles actifs pour donner un résultat avec son incertitude statistique.
+Concrètement un tally se définit par trois choses :
+Où on mesure (dans quelle cellule, sur quelle surface, dans quel volume)
+Quoi on mesure (quel type de réaction ou quelle quantité physique)
+Par rapport à quoi on filtre (par exemple par groupe d'énergie)
+Tallies utilisés : 
+Tally 1 — Taux de fission dans le cœur Compte le nombre de fissions par cm³ par neutron source. 
+Tally 2 — Flux neutronique par groupe d'énergie Mesure le flux dans le cœur séparé en deux groupes pour coller à ton modèle à deux groupes : neutrons thermiques (< 1 eV) et neutrons rapides (> 1 eV, pic à ~2 MeV).
+Tally 3 — Distribution spatiale du flux Mesure le flux en fonction de la position radiale dans le cœur, ce qui te donnera le profil spatial à comparer avec ton déterministe.
+
