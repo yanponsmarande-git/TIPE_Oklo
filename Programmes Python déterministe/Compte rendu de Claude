@@ -1,0 +1,1357 @@
+# Modélisation du réacteur nucléaire naturel RZ9 d'Oklo
+## Documentation technique du programme `Programme_Final_3.py`
+
+---
+
+## Sommaire
+
+0. Résultat en une page
+1. Le problème physique
+2. Architecture du programme
+3. Données d'entrée et hypothèses
+4. Le modèle neutronique
+5. Le modèle thermique
+6. L'hydraulique et le mécanisme du cycle
+7. La résolution numérique
+8. Référence des fonctions
+9. Résultats
+10. Validation, sensibilité, limites
+11. Comparaison Programme 2 -> Programme 3
+12. Mode d'emploi
+
+---
+
+## 0. Résultat en une page
+
+| grandeur | simulation | Oklo (RZ9) |
+|---|---|---|
+| durée de marche | **30,9 min** | ~30 min |
+| durée d'arrêt | **162,9 min** | ~150 min |
+| période | **193,8 min** | ~180 min |
+| rapport arrêt/marche | **5,27** | 5,0 |
+| puissance moyenne | **16,1 kW** | 6 à 100 kW selon les auteurs |
+| puissance de pointe | 242 kW | — |
+| fissions par minute | 2,8 x 10^16 | ~1 x 10^16 |
+| part des fissions pendant la marche | 94,9 % | — |
+| température du cœur | 609,5 -> 612,3 K | ébullition à 615,3 K |
+| dispersion sur les 5 derniers cycles | 0,13 min | — |
+
+**Aucune durée n'est fournie au programme.** Les quatre paramètres géologiques
+libres (porosité, perméabilité, distance du thermostat, gain de réflecteur)
+sont des grandeurs de composition ou de géométrie ; aucun n'est un temps.
+Les 30 min et les 2 h 30 sortent de l'intégration.
+
+Temps de calcul : **13 s pour 60 h simulées** (10 823 pas adaptatifs).
+
+---
+
+## 1. Le problème physique
+
+### 1.1 Ce qu'on cherche à reproduire
+
+Il y a 2,0 milliards d'années, l'uranium naturel titrait 3,5 % d'U235 (contre
+0,72 % aujourd'hui) : une lentille de minerai suffisamment riche et imprégnée
+d'eau pouvait devenir critique toute seule. Seize zones de ce type sont connues
+à Oklo (Gabon). L'analyse isotopique du xénon piégé dans les aluminophosphates
+indique que le réacteur ne fonctionnait pas en continu mais **par bouffées :
+environ 30 minutes de marche pour 2 h 30 d'arrêt**, et ce pendant 150 000 ans.
+
+L'objectif du programme est de faire **émerger** ce cycle des équations, pas de
+l'imposer.
+
+### 1.2 Pourquoi c'est difficile : les échelles de temps
+
+| phénomène | temps caractéristique |
+|---|---|
+| génération neutronique prompte, Lambda | 1,6 x 10^-4 s |
+| décroissance des précurseurs de neutrons retardés | 0,33 s à 80 s |
+| relaxation hydraulique de l'eau des pores, tau_h | ~60 s |
+| conduction thermique dans l'argile (sur un cycle) | ~10^3 s |
+| cycle observé | ~10^4 s |
+| durée de vie du réacteur | 5 x 10^12 s |
+
+Neuf ordres de grandeur séparent Lambda du cycle. Trois conséquences :
+
+1. **Sans neutrons retardés, le problème est insoluble.** Avec beta = 0, un
+   réacteur à k = 1,01 double sa puissance en Lambda/(k-1) = 16 ms. Aucun cycle
+   de 30 min ne peut exister. Les neutrons retardés (beta = 6,5 x 10^-3)
+   portent la période du réacteur à la minute : c'est l'échelle d'Oklo.
+2. **Le système est numériquement raide.** Un pas fixe capable de résoudre
+   Lambda demanderait ~10^8 pas pour 3 h. Il faut un pas adaptatif et une
+   intégration exacte de la partie raide.
+3. **Le schéma ne doit pas être dissipatif.** On cherche une oscillation
+   entretenue ; un schéma d'Euler implicite l'amortirait artificiellement et on
+   conclurait à tort que le cycle n'existe pas.
+
+### 1.3 Le fil rouge : où est le ressort ?
+
+Un réacteur muni d'une contre-réaction négative et de pertes thermiques
+**converge vers un régime permanent**. Pour obtenir une oscillation entretenue
+il faut soit un seuil brutal, soit un **retard** dans la boucle de
+contre-réaction.
+
+Ce programme montre que le retard existe et qu'il est inévitable : la
+contre-réaction d'Oklo passe par la densité de l'eau, or **l'eau ne peut pas
+quitter les pores instantanément**, elle doit traverser la roche. C'est le
+résultat central de la modélisation, et il a été obtenu en constatant
+numériquement que le modèle *sans* ce retard s'amortit en une dizaine de
+cycles (voir section 6.3).
+
+---
+
+## 2. Architecture du programme
+
+```
+Programme_Final_3.py   (environ 1100 lignes, 8 sections)
+
+ §1  Constantes et données nucléaires
+       sections efficaces, nu, beta_i/lambda_i, puissance résiduelle,
+       fission spontanée
+ §2  Géométrie et composition
+       densites_atomiques_solides()  ->  N_SOLIDE  (m^-3 de cœur)
+       buckling_geometrique()        ->  B2
+ §3  Propriétés de l'eau à 150 bar
+       rho_eau_liquide(T), cp_eau(T)
+ §4  NEUTRONIQUE
+       parametres_neutroniques(T_mod, T_comb, m_eau) -> k_eff, Lambda, Sigma_f.v
+       calibrer_reflecteur(), coefficients_de_temperature()
+ §5  THERMIQUE
+       5a  cœur        : etat_coeur(E) -> (T, m_vap, m_eau_eq)
+       5b  hydraulique : temps_hydraulique() -> tau_h
+       5c  argile      : maillage_1d(), resoudre_argile()  (Thomas implicite)
+ §6-7 CINÉTIQUE ET INTÉGRATION
+       pas_cinetique()  : exponentielle de matrice 7x7 (exacte)
+       simuler()        : boucle à pas adaptatif
+ §8  DIAGNOSTIC
+       analyser_cycles(), bilan_energetique(), resume()
+       diagnostic_parametres(), etude_sensibilite()
+       convergence_en_pas(), validation_cinetique()
+       tracer(), tracer_un_cycle()
+```
+
+### 2.1 Le vecteur d'état
+
+À chaque instant, l'état du réacteur tient dans **45 nombres** :
+
+| variable | taille | signification |
+|---|---|---|
+| `n` | 1 | population neutronique totale du cœur |
+| `C[i]` | 6 | précurseurs de neutrons retardés |
+| `H[j]` | 6 | énergie stockée dans les produits de fission |
+| `E` | 1 | enthalpie du cœur (donne T **et** la masse de vapeur) |
+| `m_mod` | 1 | masse d'eau réellement présente dans les pores |
+| `T_mailles[j]` | 30 | profil de température dans l'argile puis le grès |
+
+### 2.2 La boucle de couplage
+
+```
+                 +-----------------------------------------------+
+                 |                                               |
+   n, C  --->  P_fission  --->  P_déposée  --->  E  --->  T_cœur |
+    ^             (H[j] retarde 8,4 %)            |              |
+    |                                             v              |
+    |                                    m_eau d'équilibre       |
+    |                                             |              |
+    |                                   RETARD tau_h (Darcy)     |
+    |                                             |              |
+    |                                             v              |
+    +---------  rho = (k-1)/k  <---  k_eff  <--- m_mod ----------+
+                                       ^
+                               T_cœur (Doppler, spectre)
+```
+
+Les deux retards de la boucle (tau_h et la puissance résiduelle) sont ce qui
+rend l'état stationnaire instable.
+
+---
+
+## 3. Données d'entrée et hypothèses
+
+### 3.1 Géométrie
+
+| grandeur | valeur | origine |
+|---|---|---|
+| lentille | 12 m x 7 m x 0,70 m | mesures de terrain (RZ9) |
+| cylindre équivalent | R = 5,17 m, H = 0,70 m | R = racine(12.7/pi), **même empreinte au sol** |
+| volume du cœur | 58,8 m3 | pi R2 H |
+| argile (réflecteur perpendiculaire) | 0,50 m dessus et dessous | épaisseur mesurée |
+| conglomérat (latéral) | 2,0 m | — |
+| grès jusqu'au thermostat | 4,0 m | **paramètre**, voir 3.5 |
+
+> **Hypothèse H1 — cylindre équivalent.** La lentille est assimilée à un
+> cylindre de même surface au sol. Prendre R = 2,10 m (version précédente)
+> divisait le volume par 6 et surestimait très fortement les fuites radiales.
+> La forme exacte n'intervient que par le laplacien géométrique B2, de toute
+> façon dominé par le terme axial car H = 0,70 m est très mince.
+
+### 3.2 Composition du cœur
+
+Le cœur n'est pas de l'UO2 pur : c'est un grès argileux à 5 % d'uraninite.
+
+| constituant | fraction volumique | masse (58,8 m3) |
+|---|---|---|
+| uraninite UO2 (rho = 10 600 kg/m3) | 5 % | 31 164 kg |
+| eau dans la porosité | **35 %** (paramètre) | 12 418 kg à 615 K |
+| matrice argilo-silicatée (rho grains = 2650) | 60 % | 93 500 kg |
+
+Uranium : 27 471 kg, dont **961,5 kg d'U235** (enrichissement 3,5 %) et
+26 510 kg d'U238.
+
+Composition massique supposée de la matrice (argile illitique de grès
+uranifère) :
+
+| SiO2 | Al2O3 | Fe2O3 | MgO | K2O | CaO |
+|---|---|---|---|---|---|
+| 58 % | 22 % | 8 % | 4 % | 4 % | 4 % |
+
+> **Hypothèse H2 — homogénéité.** Le cœur est traité comme un mélange homogène
+> (modèle 0D). Justification : la taille des grains (mm) est très petite devant
+> la longueur de migration des neutrons (M = 20 cm). Une hétérogénéité à
+> l'échelle du grain n'introduirait pas d'auto-protection significative.
+
+> **Hypothèse H3 — pas de poison neutronique dissous.** Suivant la
+> littérature, les poisons (le bore en particulier) sont supposés lavés par la
+> circulation d'eau naturelle. En revanche les absorbants **de la matrice**
+> (Fe, K, Si, Al) sont explicitement comptés : ils pèsent 15,7 % des
+> absorptions thermiques, ce n'est pas négligeable.
+
+**Budget d'absorption thermique** (cœur à 615 K, pores pleins) :
+
+| U235 | H | U238 | Fe | K | Si | Al | Ca, Mg, O |
+|---|---|---|---|---|---|---|---|
+| 65,5 % | 10,9 % | 7,1 % | 5,7 % | 4,0 % | 3,7 % | 2,2 % | 0,8 % |
+
+C'est ce budget qui fixe le facteur d'utilisation thermique f = 0,727.
+
+### 3.3 Données nucléaires
+
+| donnée | valeur | source |
+|---|---|---|
+| sigma_f(U235) à 2200 m/s | 582,6 b | tables |
+| sigma_a(U235) | 680,9 b | tables |
+| sigma_a(U238) | 2,68 b | tables |
+| nu barre | 2,42 | tables |
+| beta total (6 groupes de Keepin) | 6,50 x 10^-3 | tables |
+| lambda_i | 0,0124 à 3,01 s^-1 | tables |
+| énergie récupérable | 195 MeV au cœur + 20 MeV à l'argile | Lamarsh & Baratta |
+| puissance résiduelle | 8,4 % de l'énergie, retardée | ajustement de f(t) = 0,0622 t^-0,2 |
+| fission spontanée U238 | 6,8 x 10^-3 fissions/g/s | T1/2(SF) = 8,2 x 10^15 ans |
+| fission spontanée U235 | 5,7 x 10^-6 fissions/g/s | négligeable devant l'U238 |
+
+**Source neutronique permanente : 3,6 x 10^5 n/s**, due à 99,97 % à la fission
+spontanée de l'U238. C'est elle qui réamorce le réacteur à chaque cycle : sans
+elle, un réacteur éteint le reste.
+
+> **Hypothèse H4 — un seul groupe thermique.** La population neutronique est
+> traitée en un groupe (thermique), les effets rapides étant portés par epsilon
+> (fissions rapides) et par la probabilité de non-fuite rapide P_NL,r. C'est le
+> modèle « deux groupes dégénéré » standard pour un réacteur thermique.
+
+> **Hypothèse H5 — spectre maxwellien à la température du modérateur.** Les
+> sections efficaces sont moyennées par sigma_barre = sigma_2200 x (racine(pi)/2)
+> x racine(T0/T), avec les facteurs de Westcott g_a et g_f pour l'écart de
+> l'U235 à la loi 1/v.
+
+### 3.4 Environnement thermique
+
+| grandeur | valeur |
+|---|---|
+| température géothermique | 150 degC = 423,15 K |
+| pression hydrostatique | 150 bar, donc T_sat = 615,31 K = 342,2 degC |
+| conductivité argile / grès / conglomérat | 1,30 / 3,00 / 0,30 W/m/K |
+| rho.cp de l'argile | 1630 x 1350 J/m3/K |
+| capacité thermique du cœur | 1,96 x 10^8 J/K |
+
+> **Hypothèse H6 — équilibre thermique local.** Combustible, matrice et eau
+> sont à la même température. Justification : la puissance volumique vaut
+> ~0,3 kW/m3 (contre ~100 MW/m3 dans un REP) et les grains font le millimètre :
+> l'écart combustible/modérateur est de l'ordre du millikelvin.
+> **Conséquence importante : l'effet Doppler est quasiment inopérant à Oklo**,
+> contrairement à un réacteur industriel où le combustible est bien plus chaud
+> que le modérateur.
+
+### 3.5 Les quatre paramètres libres, et leur statut
+
+C'est le point à défendre devant un jury.
+
+| paramètre | valeur retenue | plage physique | ce qu'il contrôle |
+|---|---|---|---|
+| `POROSITE` | 0,35 | 0,05 à 0,40 | la modération, donc k_eff |
+| `PERMEABILITE` | 3 x 10^-14 m2 (30 mD) | 10^-15 à 10^-12 m2 | tau_h, donc la durée d'arrêt |
+| `E_GRES` | 4,0 m | 2 à 10 m | la puissance évacuée, donc la puissance moyenne |
+| `REFLECTOR_SAVINGS` | 0,62 m (calculé) | 0,2 à 1,0 m | les fuites ; **étalonné**, voir 4.6 |
+
+**Aucun de ces quatre nombres n'est une durée.** Ce sont une fraction
+volumique, une perméabilité (m2), une distance (m) et une distance (m).
+La fonction `etude_sensibilite()` montre comment le cycle en dépend (10.3).
+
+> **À propos de `E_GRES`.** Ce n'est *pas* 2 m. Une source de ~15 kW réchauffe
+> la roche bien au-delà : loin de la source, T - T_infini = Q/(4 pi k r), donc
+> l'écart ne tombe à 10 % de sa valeur que vers r = 10 m. Fixer le thermostat
+> trop près surestime la puissance évacuée, donc la puissance du réacteur.
+
+---
+
+## 4. Le modèle neutronique
+
+Tout est dans `parametres_neutroniques(T_moderateur, T_combustible, masse_eau)`.
+Cette fonction est le cœur du programme : elle prend l'état thermohydraulique et
+rend `k_eff`, le temps de génération `Lambda` et le produit `Sigma_f . v` qui
+convertit la population neutronique en taux de fission.
+
+### 4.1 Densités atomiques
+
+On construit d'abord le dictionnaire des densités atomiques par mètre cube de
+cœur. Les solides sont calculés une fois pour toutes
+(`densites_atomiques_solides()`), l'eau est ajoutée à chaque appel puisque sa
+masse varie :
+
+```
+n_H2O = (masse_eau / 0,018015) x N_A / V_COEUR      molécules par m3 de cœur
+N[H] += 2 n_H2O ;  N[O] += n_H2O
+```
+
+C'est **le seul point d'entrée de la thermohydraulique dans la neutronique** :
+toute la contre-réaction passe par `masse_eau`.
+
+### 4.2 Moyenne du spectre thermique
+
+Pour un absorbant en 1/v et un spectre maxwellien à la température T :
+
+```
+sigma_barre(T) = sigma_2200 x (racine(pi)/2) x racine(T0/T)      T0 = 293,6 K
+```
+
+Ce facteur est commun à tous les nucléides en 1/v : il se simplifie dans les
+rapports eta et f. Ce qui ne se simplifie pas, c'est l'écart de l'U235 à la loi
+1/v, décrit par les **facteurs de Westcott** g_a(T) et g_f(T) (tabulés,
+interpolés). C'est un effet de quelques pour cent.
+
+### 4.3 Les six facteurs
+
+**eta, facteur de reproduction** — nombre de neutrons produits par neutron
+absorbé dans le combustible :
+
+```
+eta = nu x Sigma_f(U235) / (Sigma_a(U235) + Sigma_a(U238))       = 1,803
+```
+
+**f, facteur d'utilisation thermique** — fraction des absorptions qui a lieu
+dans le combustible :
+
+```
+f = Sigma_a(combustible) / Sigma_a(total)                        = 0,727
+```
+
+La différence à 1 vient de l'hydrogène (10,9 %) et de la gangue (15,7 %).
+Dans le programme 2 ce facteur était une constante ajustée à 0,66 : il est
+maintenant calculé.
+
+**epsilon, facteur de fission rapide** = 1,02, **seule constante non calculée**.
+Dans un milieu quasi homogène et très dilué en uranium (5 % d'uraninite en
+volume), un neutron rapide a peu de chances de rencontrer un noyau d'U238 avant
+d'être ralenti sous le seuil de fission rapide (~1 MeV). La valeur exacte est
+sans effet sur la dynamique : c'est un facteur multiplicatif constant de k_eff,
+entièrement absorbé par l'étalonnage du réflecteur (4.6).
+
+**p, facteur antitrappe** — probabilité d'échapper aux résonances de capture de
+l'U238 pendant le ralentissement. Formule du milieu homogène :
+
+```
+sigma_pot = Sigma_s / N(U238)                      (barns par atome d'U238)
+I_eff     = 3,9 x sigma_pot^0,415                  (intégrale de résonance eff.)
+p         = exp( - N(U238) x I_eff / (xi.Sigma_s) )              = 0,826
+```
+
+Noter que **p existe parce qu'il y a de l'U238** : le programme 2 le posait à
+1 « faute d'U238 », alors que le combustible en contient 96,5 %.
+
+**Effet Doppler** — l'agitation thermique des noyaux d'U238 élargit les
+résonances et augmente l'intégrale effective :
+
+```
+I_eff(T) = I_eff(T0) x [ 1 + beta_Doppler x (racine(T) - racine(T0)) ]
+beta_Doppler = 0,0075 K^-1/2
+```
+
+Cela donne environ **-2 pcm/K**, ce qui est la valeur de manuel. Le paramètre
+dépend de la **température du combustible** (`T_combustible`), pas de celle du
+modérateur. À Oklo, combustible et modérateur étant à la même température
+(H6), l'effet Doppler est marginal devant l'effet de densité d'eau
+(-98 pcm/K) : c'est un résultat, pas une hypothèse.
+
+**P_NL, probabilités de non-fuite** — modèle à deux groupes :
+
+```
+D    = 1 / (3 Sigma_tr)                    coefficient de diffusion
+L2   = D / Sigma_a                         aire de diffusion   = 21,0 cm2
+tau  = tau(eau pure) x (xi.Sigma_s,ref / xi.Sigma_s) x (Sigma_s,ref / Sigma_s)
+                                           âge de Fermi        = 370 cm2
+P_NL,thermique = 1 / (1 + B2 L2)                               = 0,994
+P_NL,rapide    = 1 / (1 + B2 tau)                              = 0,906
+```
+
+L'âge de Fermi est normalisé sur la valeur connue de l'eau légère
+(tau = 27 cm2) et mis à l'échelle par la capacité de ralentissement du milieu.
+C'est **lui qui porte l'essentiel de la contre-réaction** : quand l'eau part,
+xi.Sigma_s chute, tau explose et les neutrons rapides fuient.
+
+Aire de migration M2 = L2 + tau = 391 cm2, soit **M = 20 cm** : à comparer à la
+demi-épaisseur du cœur (35 cm). Le réacteur est très mince devant la longueur
+de migration, d'où l'importance capitale du réflecteur.
+
+**Bilan** (cœur à 615 K, pores pleins, après étalonnage) :
+
+```
+k_inf = eta x epsilon x f x p                      = 1,104
+k_eff = k_inf x P_NL,th x P_NL,r                   = 0,995
+```
+
+### 4.4 Le laplacien géométrique et le gain de réflecteur
+
+```
+B2 = (2,405 / R_eff)^2 + (pi / H_eff)^2
+R_eff = R + delta        H_eff = H + 2 delta        delta = REFLECTOR_SAVINGS
+```
+
+Un réflecteur épais renvoie une partie des neutrons : vu de la neutronique, le
+cœur se comporte comme s'il était plus grand de `delta`. Ordre de grandeur de
+`delta` : la longueur de migration dans le réflecteur, soit 0,2 à 1,0 m. Sans
+ce terme, B2 = 21 m^-2 (le terme axial écrase tout, H = 0,70 m) et le réacteur
+ne peut pas diverger ; avec delta = 0,62 m, B2 = 2,79 m^-2.
+
+### 4.5 Le temps de génération
+
+```
+duree de ralentissement = 1e-5 s x (xi.Sigma_s,ref / xi.Sigma_s)
+duree de vie thermique  = 1 / ( v_th x (Sigma_a + D B2) )
+Lambda                  = (somme des deux) / k_eff              = 1,6 x 10^-4 s
+```
+
+Lambda ne joue que sur la dynamique **prompte**. Comme la réactivité reste
+toujours très inférieure à beta (rho max = +3 x 10^-4, soit 0,05 beta), une
+erreur sur Lambda est sans conséquence sur le cycle. C'est un point rassurant :
+le résultat ne dépend pas de la grandeur la plus mal connue.
+
+### 4.6 L'étalonnage du réflecteur — le point délicat
+
+`calibrer_reflecteur()` résout par dichotomie, sur `delta`, l'équation
+
+```
+k_eff(T = T_sat, pores pleins) = K_MARGINAL = 0,9950
+```
+
+**Ce n'est pas un réglage libre**, et deux arguments physiques indépendants
+imposent une valeur juste inférieure à 1 :
+
+1. **Usure du combustible.** À 16 kW, la zone consomme environ 5 x 10^14 noyaux
+   d'U235 par seconde, soit 1 % de son stock en ~1500 ans. Une réactivité en
+   excès de 1 % serait dévorée en quelques milliers d'années, alors que RZ9 a
+   fonctionné 150 000 ans. Le réacteur a donc passé l'essentiel de sa vie à
+   quelques 10^-3 de la criticité exacte.
+2. **Auto-régulation par l'eau.** Si k_eff était supérieur à 1 à 615 K, le cœur
+   bouillirait et chasserait irréversiblement son eau jusqu'à repasser sous 1.
+   L'état k_eff(T_sat) légèrement inférieur à 1 est donc un attracteur
+   géologique.
+
+Formulation équivalente et plus parlante : **le réacteur est exactement
+critique à 610,2 K = 337,1 degC, soit 5,1 K sous l'ébullition.**
+
+Ce qui reste discutable, c'est la valeur exacte (0,995 plutôt que 0,997 ou
+0,993). L'étude de sensibilité (10.3) montre que le cycle bouge peu sur cette
+plage : 29 à 35 min de marche, 154 à 166 min d'arrêt. **La durée du cycle
+n'est donc pas fixée par cet étalonnage.**
+
+---
+
+## 5. Le modèle thermique
+
+### 5.1 Le cœur : une seule variable, l'enthalpie
+
+Le programme 2 traitait séparément température et fraction de vapeur, avec des
+branches `if` et une variable `temp_finale` parfois non affectée. Ici il n'y a
+**qu'une variable d'état, l'enthalpie E**, et l'état physique s'en déduit :
+
+```
+E < E_SAT   ->  T = T(E) par interpolation, m_vap = 0, pores pleins de liquide
+E > E_SAT   ->  T = T_SAT,  m_vap = (E - E_SAT) / L_vap
+```
+
+La table E(T) est construite une fois au chargement (`_table_enthalpie()`) en
+intégrant la capacité thermique totale :
+
+```
+C(T) = m_matrice.cp_matrice + m_UO2.cp_UO2 + m_eau(T).cp_eau(T)  = 1,96e8 J/K
+```
+
+Avantages : pas de test de branche dans la boucle, monotonie garantie, aucun
+risque de variable non initialisée, et le passage liquide/diphasique est
+continu.
+
+> **Hypothèse H7 — capacité thermique de l'eau.** Le cp de l'eau à 150 bar
+> diverge près de la saturation (4310 J/kg/K à 150 degC, 8800 à 342 degC). La
+> table `_CP_EAU` reproduit cette montée. L'eau compte pour ~35 % de la
+> capacité thermique totale du cœur.
+
+### 5.2 Le régime diphasique et le rapport de chasse
+
+Point physique important, et souvent mal traité. Le volume des pores est fixe.
+Si on y crée 1 kg de vapeur (rho = 96,7 kg/m3), celle-ci occupe 1/96,7 m3 alors
+que le liquide disparu n'en libérait que 1/603,4. Le liquide excédentaire est
+donc **expulsé** vers la roche encaissante :
+
+```
+RAPPORT_CHASSE = rho_liquide / rho_vapeur - 1 = 5,24
+```
+
+Autrement dit **chaque kilogramme vaporisé retire 6,24 kg d'eau des pores**
+(1 kg devenu vapeur, plus 5,24 kg de liquide chassé), pour un coût énergétique
+d'un seul L_vap. La vaporisation est donc un moyen extraordinairement efficace
+de détruire la modération : c'est le mécanisme « geyser » de la littérature.
+
+Dans la configuration retenue, **ce régime n'est jamais atteint** (le cœur
+oscille entre 609,5 et 612,3 K, sous les 615,3 K de l'ébullition). Le code le
+gère quand même, car il s'active dès qu'on déplace les paramètres vers plus de
+réactivité (voir 10.4).
+
+### 5.3 L'argile et le grès : conduction 1D transitoire
+
+**Pourquoi transitoire et pas quasi permanent ?** La diffusivité thermique de
+l'argile vaut a = k/(rho.cp) = 5,9 x 10^-7 m2/s. Sur un cycle de 3 h, la
+profondeur de pénétration est
+
+```
+racine(a . t) = racine(5,9e-7 x 10800) = 8 cm
+```
+
+Seuls les 8 premiers centimètres d'argile « respirent » avec le cycle. Un
+modèle quasi permanent (conductance constante) surestimerait fortement
+l'échange et fausserait entièrement l'amortissement. C'est pour cela que le
+programme maille l'argile.
+
+**Maillage** (`maillage_1d()`) : 18 mailles dans 0,50 m d'argile, puis 12 dans
+4,0 m de grès, en **progression géométrique de raison 1,32**. La première
+maille fait 1,1 mm, ce qui résout largement la couche limite thermique
+(3,4 mm en 20 s). Au-delà : thermostat à 423,15 K.
+
+**Résolution** (`resoudre_argile()`) : Euler implicite, système tridiagonal
+résolu par l'**algorithme de Thomas** (élimination avant puis remontée),
+coût O(N) par pas.
+
+**Dépôt des gamma** : les 20 MeV par fission qui s'échappent du cœur sont
+déposés dans l'argile avec une pondération exponentielle de longueur
+d'atténuation 0,20 m (`_POIDS_GAMMA`).
+
+**Voie latérale** : le conglomérat (k = 0,30 W/m/K, 2 m, 68 m2) donne
+UA = 3,41 W/K, négligeable devant la voie axiale. Il est traité en régime
+quasi permanent.
+
+> **Hypothèse H8 — conduction pure.** Aucune convection n'est modélisée dans
+> l'encaissant. C'est une sous-estimation possible du refroidissement : une
+> circulation hydrothermale évacuerait davantage. Cet effet est absorbé par le
+> paramètre `E_GRES`.
+
+### 5.4 La puissance résiduelle
+
+Une fraction de l'énergie de fission n'est pas libérée au moment de la fission :
+elle est stockée dans les produits de fission et restituée par décroissance
+beta et gamma, de la seconde à la journée. On l'ajuste par une somme de six
+exponentielles sur la loi f(t) = 0,0622 t^-0,2 (U235, marche infinie) :
+
+| lambda_j (s^-1) | 1,0 | 0,1 | 0,01 | 1e-3 | 1e-4 | 1e-6 |
+|---|---|---|---|---|---|---|
+| gamma_j | 0,0310 | 0,0195 | 0,0130 | 0,0068 | 0,0067 | 0,0073 |
+
+Somme : **8,4 %** de l'énergie de fission (l'ordre de grandeur de manuel est
+6 à 7 % ; l'ajustement surestime un peu aux temps très longs).
+
+Équations, intégrées **exactement** sur le pas à taux de fission figé :
+
+```
+dH_j/dt   = gamma_j P_fission - lambda_j H_j
+P_déposée = (1 - gamma_total) P_fission + somme( lambda_j H_j )
+```
+
+Cette puissance retardée introduit un déphasage dans la boucle. On a vérifié
+qu'elle est **insuffisante à elle seule** pour entretenir le cycle (facteur ~6
+trop faible), mais elle y contribue.
+
+---
+
+## 6. L'hydraulique et le mécanisme du cycle
+
+C'est la partie la plus originale du modèle, et le résultat central.
+
+### 6.1 Pourquoi un retard est physiquement obligatoire
+
+La contre-réaction du réacteur passe presque entièrement par la **densité de
+l'eau** : -98 pcm/K, contre -2 pcm/K pour le Doppler. Or dire que la densité de
+l'eau des pores suit instantanément rho_liquide(T), c'est supposer que l'eau
+dilatée quitte instantanément la roche. C'est faux : c'est un **écoulement de
+Darcy**, donc une diffusion de pression, de constante de temps
+
+```
+tau_h = phi . mu . c_t . L^2 / k
+```
+
+| symbole | valeur | signification |
+|---|---|---|
+| phi | 0,35 | porosité |
+| mu | 8,6e-5 Pa.s | viscosité de l'eau à 340 degC |
+| c_t | 5e-9 Pa^-1 | compressibilité (eau chaude + squelette) |
+| L | 3,5 m | demi-largeur de drainage de la lentille |
+| k | 3e-14 m2 (30 mD) | perméabilité intrinsèque, **paramètre** |
+
+d'où **tau_h = 61 s**. Le minerai d'Oklo est un grès, et la littérature suppose
+d'ailleurs les poisons « lavés » par la circulation d'eau, ce qui implique une
+bonne perméabilité : 10 à 100 mD est un ordre de grandeur banal.
+
+Le modèle est une relaxation du premier ordre :
+
+```
+d m_mod / dt = ( m_équilibre(E) - m_mod ) / tau_h
+```
+
+intégrée exactement sur le pas (`relax = exp(-h/tau_h)`), avec `m_équilibre`
+évalué au point milieu du pas.
+
+### 6.2 Pourquoi ce retard déstabilise
+
+La boucle comporte deux intégrateurs purs :
+
+| maillon | relation | déphasage |
+|---|---|---|
+| puissance -> température | T = integrale de (P - Q)/C | -90 degrés |
+| réactivité -> puissance | d(ln P)/dt = rho . lambda_moyen / beta | -90 degrés |
+| contre-réaction | rho = -alpha (T - T_c) | 0 |
+
+Total : **exactement -180 degrés**, c'est-à-dire la limite de stabilité. Le
+système n'est stabilisé que par le petit terme d'amortissement dû à la
+dépendance en température de la puissance évacuée : le taux d'amortissement
+mesuré numériquement vaut zeta = 0,016 environ, soit une dizaine de cycles pour
+s'éteindre.
+
+**Tout retard supplémentaire fait franchir les -180 degrés.** Un retard du
+premier ordre apporte jusqu'à -90 degrés de plus (effet maximal lorsque
+omega.tau_h vaut environ 1). Le gain déstabilisant dépasse alors largement le
+faible amortissement : l'état stationnaire devient un foyer instable, et la
+non-linéarité (la puissance ne peut pas descendre sous le niveau imposé par la
+fission spontanée) borne l'amplitude. On obtient un **cycle limite**.
+
+### 6.3 La vérification numérique
+
+C'est le test décisif, et il a été fait dans les deux sens.
+
+On refait tourner le modèle **complet**, en ne changeant que la perméabilité,
+donc tau_h. Suites de cycles mesurées sur 40 h simulées :
+
+| tau_h | marches successives (min) | arrêts successifs (min) | verdict |
+|---|---|---|---|
+| 0,06 s | 32 - 35 - 37 - 39 - 41 - ... - 55 | 149 - 128 - 113 - 102 - ... - 61 | **amortie** |
+| 61 s | 31,0 - 31,0 - 31,0 - 31,0 - 31,0 - ... | 174 - 169 - 167 - 166 - 165 - ... - 163 | **cycle limite** |
+
+Sans le retard, l'amplitude décroît régulièrement : la marche s'allonge et
+l'arrêt raccourcit, le rapport cyclique tend vers 50/50, c'est-à-dire vers le
+régime permanent. Avec le retard, la durée de marche est **verrouillée à
+31,0 min** dès le premier cycle et l'arrêt converge vers 163 min.
+
+On a également testé la puissance résiduelle seule (tau_h -> 0, produits de
+fission actifs) : elle ne suffit pas, le déphasage qu'elle apporte est environ
+six fois trop faible pour compenser l'amortissement.
+
+Le portrait de phase (figure 1, en bas à droite) tranche visuellement : une
+courbe fermée parcourue à l'identique cycle après cycle est la signature d'un
+cycle limite, pas d'un transitoire.
+
+### 6.4 Déroulement d'un cycle
+
+En reprenant la figure « Un cycle », avec t = 0 au début de la marche :
+
+| phase | durée | ce qui se passe |
+|---|---|---|
+| **arrêt, refroidissement** | ~110 min | La puissance est de ~150 W, très inférieure aux 16 kW évacués. Le cœur perd environ 1 K par heure. L'eau se contracte, sa densité remonte, k_eff remonte lentement vers 1. |
+| **passage de la criticité** | t = -45 min | k_eff franchit 1. La population neutronique, entretenue jusque-là par la seule fission spontanée, se met à croître à la période des neutrons retardés. |
+| **montée** | ~45 min | La puissance grimpe de 150 W à 16 kW. Le cœur continue pourtant de se refroidir tant que P < Q, donc k_eff continue de monter : la montée s'accélère. |
+| **marche** | **31 min** | P dépasse Q : le cœur se réchauffe, l'eau se dilate et est chassée. Pic à 242 kW. |
+| **extinction** | ~10 min | m_mod a chuté de 45 kg, k_eff est retombé à 0,99975. La puissance s'effondre de trois décades. |
+| **retour** | | Le cœur recommence à se refroidir : tout recommence à l'identique. |
+
+Points remarquables :
+
+- **L'amplitude en température n'est que de 2,8 K** (609,5 à 612,3 K). Le
+  coefficient de -98 pcm/K est si fort qu'il n'en faut pas davantage.
+- **L'amplitude en eau n'est que de 45 kg sur 12 800**, soit 0,35 %.
+- **La réactivité ne dépasse jamais +3e-4**, soit 0,05 beta : le réacteur n'est
+  **jamais** prompt-critique. C'est ce qui rend possible un cycle lent.
+- **94,9 % des fissions ont lieu pendant les 31 min de marche**, ce qui est
+  cohérent avec un enregistrement isotopique en bouffées.
+
+L'asymétrie 1:5 n'est pas imposée. Elle vient de ce que la fission dépose
+l'énergie bien plus vite que la conduction ne l'évacue :
+
+```
+t_arrêt / t_marche  ~  P_marche / P_conduction - 1  ~  5
+```
+
+---
+
+## 7. La résolution numérique
+
+### 7.1 Le problème : raideur ET non-dissipativité
+
+Deux exigences contradictoires :
+
+- **raideur** : Lambda = 1,6e-4 s, cycle = 1e4 s, soit un rapport de 6e7. Un
+  schéma explicite exigerait un pas de l'ordre de Lambda ;
+- **non-dissipativité** : on cherche une oscillation entretenue. Les schémas
+  implicites inconditionnellement stables (Euler implicite en tête) sont
+  L-stables, donc **dissipatifs** : ils amortiraient artificiellement le cycle.
+
+La solution retenue exploite le fait que **le système de cinétique ponctuelle
+est linéaire à réactivité figée**.
+
+### 7.2 La cinétique : exponentielle de matrice
+
+Sur un pas, à rho et Lambda gelés, le système s'écrit y' = A y + b avec
+
+```
+y = (n, C1, ..., C6)
+
+        | (rho-beta)/Lambda   lambda_1  ...  lambda_6 |
+    A = |   beta_1/Lambda     -lambda_1              |
+        |       ...                    ...           |
+        |   beta_6/Lambda                  -lambda_6 |
+
+    b = (S, 0, ..., 0)          S = source de fission spontanée
+```
+
+Solution exacte :
+
+```
+y(h) = V . [ exp(w h) . z  +  phi(w h) . s ]
+avec  A = V diag(w) V^-1,  z = V^-1 y0,  s = V^-1 b,
+      phi(x) = (e^x - 1)/w   prolongé par continuité en w = 0
+```
+
+Les 7 valeurs propres de A sont les 7 racines de l'équation inhour ; elles sont
+réelles. La diagonalisation est **mise en cache** (`_diagonaliser`) tant que rho
+varie de moins de 1e-7, ce qui économise l'essentiel du coût pendant les phases
+calmes.
+
+**Cette intégration est exacte** : elle n'introduit aucun amortissement
+numérique, et le pas n'est plus limité que par la vitesse à laquelle la
+*réactivité* évolue — pas par Lambda. C'est ce qui fait passer de 1e8 pas à 1e4.
+
+**Validation** (`validation_cinetique()`, rho = 1e-3, Lambda = 3e-4 s) :
+
+```
+période stable, équation inhour  : 55,3250 s
+période stable, 100 pas de 1 s   : 55,3249 s
+période stable, 1 pas de 100 s   : 55,3249 s   <- identique : intégration exacte
+écart relatif : 1e-6
+```
+
+### 7.3 Le pas adaptatif
+
+Bornes appliquées avant le pas :
+
+```
+h <= h_max                                       (20 s par défaut)
+h <= 0,02 . C / |dE/dt|          si monophasique (variation de T <= 0,02 K)
+h <= 2 . L_vap / |dE/dt|         si diphasique   (<= 2 kg de vapeur)
+```
+
+Contrôle *a posteriori* : le pas est rejeté et réduit si
+
+```
+|rho_nouveau - rho_ancien| > tol . beta        (tol = 6e-3 par défaut)
+ou  |ln(n_nouveau / n_ancien)| > 0,7           (facteur 2 par pas maximum)
+```
+
+Résultat : 10 823 pas pour 60 h, dont quelques centaines seulement pendant les
+pics de puissance.
+
+### 7.4 Le couplage cœur / argile, rendu conservatif
+
+Piège classique, et corrigé dans cette version. Si le cœur perd
+G.(T_cœur - T_maille0^ancien).h alors que le schéma implicite dépose
+G.(T_cœur - T_maille0^nouveau).h dans l'argile, l'énergie n'est pas conservée.
+Ici G = 4,0e5 W/K (première maille très fine) : un écart de 0,001 K représente
+400 W, soit 2,5 % de la puissance évacuée. L'erreur est du premier ordre en h.
+
+Correction : l'argile est résolue **à l'intérieur** de la boucle
+prédicteur-correcteur, pilotée par la température de cœur au point milieu, et
+**le flux utilisé pour le bilan du cœur est exactement celui que le schéma
+implicite dépose dans l'argile**.
+
+**Vérification** (`convergence_en_pas()`, 40 h simulées) :
+
+| h_max | pas | marche | arrêt | P moyenne |
+|---|---|---|---|---|
+| 20,00 s | 7 205 | 31,00 min | 163,00 min | 15,13 kW |
+| 5,00 s | 28 801 | 31,17 min | 161,75 min | 15,06 kW |
+| 1,25 s | 38 401 | 31,12 min | 161,81 min | 15,07 kW |
+
+Entre 5 s et 1,25 s, les durées ne bougent plus que de 0,05 min : le résultat
+est convergé. Le réglage par défaut (h_max = 20 s) coûte 0,5 % sur la marche et
+0,7 % sur l'arrêt, très en dessous de l'incertitude physique.
+
+### 7.5 Ce qui est intégré exactement, et ce qui ne l'est pas
+
+| équation | schéma | ordre |
+|---|---|---|
+| cinétique (n, C_i) | exponentielle de matrice | **exact** |
+| produits de fission (H_j) | exponentielle scalaire | **exact** |
+| relaxation hydraulique (m_mod) | exponentielle scalaire | **exact** |
+| enthalpie du cœur (E) | point milieu, 2 itérations | 2 |
+| conduction dans l'argile | Euler implicite (Thomas) | 1 |
+
+Le seul maillon d'ordre 1 est la conduction, ce qui est acceptable : l'argile
+est un puits de chaleur diffusif, sans dynamique propre à résoudre finement.
+C'est ce qui explique le résidu de 0,7 % observé au 7.4.
+
+---
+
+## 8. Référence des fonctions
+
+Vingt-huit fonctions, regroupées par rôle. Pour chacune : ce qu'elle prend, ce
+qu'elle rend, et le point de physique ou de numérique qu'elle porte.
+
+### 8.1 Composition et géométrie
+
+**`xi_ralentissement(A)`** — ligne 139
+Décrément logarithmique moyen d'énergie par choc élastique sur un noyau de
+masse A : xi = 1 + a.ln(a)/(1-a) avec a = ((A-1)/(A+1))^2. Vaut 1 pour
+l'hydrogène (traité à part car la formule diverge), 0,12 pour l'oxygène,
+0,0084 pour l'uranium. Appelée une seule fois au chargement pour remplir le
+dictionnaire `XI`.
+
+**`buckling_geometrique()`** — ligne 233
+Rend B2 = (2,405/R_eff)^2 + (pi/H_eff)^2 pour un cylindre agrandi du gain de
+réflecteur. Relit les variables globales `R_COEUR`, `H_COEUR`,
+`REFLECTOR_SAVINGS` : elle est donc rappelée à chaque itération de
+l'étalonnage.
+
+**`densites_atomiques_solides()`** — ligne 240
+Construit le dictionnaire des densités atomiques (m^-3 de cœur) des
+constituants solides : uraninite décomposée en U235/U238/O, puis chaque oxyde
+de la matrice décomposé en ses éléments. Ne contient pas l'eau, ajoutée à
+chaque appel neutronique puisque sa masse varie. Résultat dans `N_SOLIDE`.
+
+### 8.2 Propriétés de l'eau
+
+**`rho_eau_liquide(T)`** — ligne 287
+Masse volumique de l'eau liquide par la corrélation IAPWS de la ligne de
+saturation (6 termes en puissances fractionnaires de 1 - T/T_critique).
+Écrêtée à T_SAT. L'écart au liquide sous-refroidi réel à 150 bar est inférieur
+à 1 %, l'eau étant quasi incompressible. **C'est cette fonction qui porte toute
+la contre-réaction du réacteur** : sa pente vaut -3 kg/m3/K vers 340 degC,
+soit -0,5 % par kelvin.
+
+**`cp_eau(T)`** — ligne 304
+Interpolation linéaire de la capacité thermique massique à 150 bar
+(4310 J/kg/K à 150 degC, 8800 à la saturation).
+
+### 8.3 Neutronique
+
+**`parametres_neutroniques(T_moderateur, T_combustible, masse_eau)`** — ligne 323
+**La fonction centrale.** Calcule les densités atomiques (solides + eau),
+moyenne les sections efficaces sur un spectre maxwellien avec les facteurs de
+Westcott, puis les six facteurs, les aires de diffusion et de ralentissement,
+les probabilités de non-fuite, k_eff et le temps de génération Lambda.
+Rend `(k_eff, Lambda, Sigma_f x v, detail)` où `detail` est un dictionnaire des
+six facteurs (utilisé par les diagnostics). Appelée 3 à 4 fois par pas de
+temps : c'est le point chaud du programme.
+
+**`calibrer_reflecteur(k_cible, bornes)`** — ligne 420
+Dichotomie à 60 itérations sur `REFLECTOR_SAVINGS` pour atteindre
+k_eff(T_sat, pores pleins) = k_cible. Lève `ValueError` si la composition ne
+permet pas d'atteindre la cible sur l'intervalle (cœur trop absorbant ou trop
+pauvre). Modifie les globales `REFLECTOR_SAVINGS` et `B2_GEO`.
+Justification physique de la cible : section 4.6.
+
+**`coefficients_de_temperature()`** — ligne 448
+Dérive numériquement k_eff pour rendre le coefficient de température
+(-98 pcm/K, différence finie sur 2 K, en faisant varier *simultanément* la
+température et la densité de l'eau) et le coefficient de vide (-7,4 pcm par kg
+de vapeur, en retirant 20 kg de vapeur donc 105 kg d'eau).
+
+### 8.4 Thermique du cœur
+
+**`_table_enthalpie()`** — ligne 477
+Construit, une fois au chargement, la table monotone E(T) sur 2000 points entre
+373 K et T_SAT, par intégration trapézoïdale de C(T). Rend aussi C(T) pour
+`capacite_coeur`. C'est ce qui permet d'utiliser l'enthalpie comme unique
+variable d'état thermique.
+
+**`etat_coeur(E)`** — ligne 495
+Inverse la table : rend `(température, masse de vapeur, masse d'eau
+d'équilibre)`. En dessous de E_SAT, la masse d'eau d'équilibre vaut
+rho_liquide(T) x V_pores. Au-dessus, la température est bloquée à T_SAT et
+chaque kg de vapeur retire `RAPPORT_CHASSE + 1 = 6,24` kg d'eau des pores.
+**Attention : cette fonction rend la masse d'eau *d'équilibre thermodynamique*,
+pas la masse réellement présente.** C'est `m_mod`, relaxée avec le retard
+tau_h, qui est utilisée par la neutronique.
+
+**`capacite_coeur(T)`** — ligne 536
+Interpolation de C(T) dans la table. Sert au contrôle du pas de temps.
+
+**`temps_hydraulique()`** — ligne 532
+Rend tau_h = phi.mu.c_t.L^2/k. Isolée en fonction pour que l'étude de
+sensibilité puisse faire varier la perméabilité.
+
+### 8.5 Thermique de l'encaissant
+
+**`maillage_1d(n_argile, n_gres)`** — ligne 546
+Construit un maillage à progression géométrique (raison 1,32), raffiné au
+contact du cœur : 18 mailles d'argile puis 12 de grès, soit 30 mailles.
+Rend épaisseurs, conductivités et rho.cp par maille.
+
+**`resoudre_argile(T_mailles, T_coeur, h, source)`** — ligne 582
+Un pas d'Euler implicite sur le maillage 1D. Assemble le système tridiagonal
+(capacité/h sur la diagonale, conductances d'interface hors diagonale,
+conditions aux limites : cœur d'un côté, thermostat de l'autre), puis le résout
+par l'algorithme de Thomas. `source` porte le dépôt gamma.
+
+**`profil_argile_permanent(T_coeur)`** — ligne 678
+Profil de température en régime permanent (interpolation linéaire en résistance
+thermique cumulée). Sert uniquement de condition initiale, pour éviter de
+simuler les six jours de mise en température.
+
+### 8.6 Cinétique et intégration
+
+**`_diagonaliser(rho, Lambda)`** — ligne 639
+Diagonalise la matrice 7x7 de cinétique ponctuelle et rend `(w, V, s)`. Mise en
+cache tant que rho varie de moins de 1e-7 et Lambda de moins de 1e-8.
+
+**`pas_cinetique(n, C, rho, Lambda, h)`** — ligne 657
+Avance exactement (n, C) d'un pas h à réactivité gelée, par exponentielle de
+matrice (section 7.2). Garde-fou : si le résultat est non fini ou négatif (cas
+pathologique), on retombe sur le niveau sous-critique d'équilibre.
+
+**`simuler(duree, tol, h_max, dt_enreg, verbose)`** — ligne 691
+**La boucle principale.** Initialise l'état (cœur 3 K sous la saturation,
+profil d'argile permanent, précurseurs et produits de fission à l'équilibre),
+puis itère : bornes sur le pas, prédicteur-correcteur couplé (cinétique,
+produits de fission, argile, enthalpie, relaxation hydraulique), contrôle
+d'erreur avec rejet éventuel, enregistrement échantillonné.
+Rend un dictionnaire de tableaux numpy : `t, P, k, T, m_eau, m_vap, Q,
+T_argile`.
+
+### 8.7 Diagnostic et validation
+
+**`analyser_cycles(res)`** — ligne 818
+Découpe la chronique en cycles. Le réacteur est déclaré **en marche quand la
+puissance de fission dépasse la puissance évacuée** : c'est un critère physique
+(le cœur se réchauffe), pas un seuil arbitraire. Rend les tableaux des durées
+de marche, d'arrêt et des périodes.
+
+**`bilan_energetique(res)`** — ligne 843
+Rend la fraction des fissions produites pendant les phases de marche (94,9 %)
+et la puissance moyenne sur toute la chronique.
+
+**`diagnostic_parametres()`** — ligne 854
+Affiche le bilan du modèle : géométrie, inventaire, k_eff dans quatre états de
+référence avec le détail des six facteurs, coefficients de contre-réaction,
+température de criticité exacte, tau_h, puissance résiduelle.
+
+**`resume(res, marches, arrets, periodes)`** — ligne 901
+Tableau de comparaison avec les observations d'Oklo, calculé sur le dernier
+tiers des cycles (régime établi).
+
+**`etude_sensibilite(duree)`** — ligne 936
+Balaye la perméabilité et la criticité marginale, ré-étalonne le réflecteur à
+chaque point, et mesure le cycle. Restaure les valeurs initiales en sortie.
+C'est la réponse à la question « le résultat est-il un réglage ? ».
+
+**`convergence_en_pas(duree, pas)`** — ligne 1072
+Divise h_max par 4 deux fois de suite et vérifie que les durées du cycle ne
+bougent plus. Contrôle numérique indispensable.
+
+**`validation_cinetique(rho, Lambda)`** — ligne 1098
+Compare l'intégrateur à la solution exacte de l'équation inhour (résolue par
+dichotomie), et vérifie qu'un seul grand pas donne le même résultat que cent
+petits.
+
+**`tracer(res, marches, arrets)`** — ligne 980
+Six graphes : puissance en échelle log et linéaire, k_eff, masse d'eau,
+températures, **portrait de phase** (log P en fonction de la masse d'eau).
+Appelle ensuite `tracer_un_cycle`.
+
+**`tracer_un_cycle(res, marches, arrets)`** — ligne 1034
+Zoom sur le dernier cycle établi : puissance (avec la phase de marche grisée),
+k_eff, masse d'eau. C'est la figure à présenter.
+
+---
+
+## 9. Résultats
+
+### 9.1 Bilan neutronique (cœur à 615 K, pores pleins)
+
+| facteur | valeur | commentaire |
+|---|---|---|
+| eta | 1,803 | neutrons produits par absorption dans le combustible |
+| epsilon | 1,02 | fissions rapides (constante supposée) |
+| f | 0,727 | 15,7 % des absorptions sont perdues dans la gangue |
+| p | 0,826 | résonances de l'U238 |
+| **k_inf** | **1,104** | |
+| P_NL thermique | 0,994 | |
+| P_NL rapide | 0,906 | c'est là que se joue la contre-réaction |
+| **k_eff** | **0,995** | par construction (étalonnage) |
+
+Longueurs caractéristiques : L2 = 21,0 cm2, âge de Fermi tau = 370 cm2, aire de
+migration M2 = 391 cm2, soit M = 20 cm pour une demi-épaisseur de cœur de
+35 cm. Temps de génération Lambda = 1,6e-4 s.
+
+### 9.2 k_eff dans quatre états
+
+| état | k_eff | eta | f | p | P_NL,r |
+|---|---|---|---|---|---|
+| pores pleins, 615 K | 0,9950 | 1,803 | 0,727 | 0,826 | 0,906 |
+| 10 % d'eau en moins | 0,9748 | 1,803 | 0,735 | 0,815 | 0,891 |
+| 30 % d'eau en moins | 0,9116 | 1,803 | 0,751 | 0,784 | 0,848 |
+| cœur froid, 423 K | 1,0479 | 1,826 | 0,683 | 0,869 | 0,951 |
+
+Lecture : perdre de l'eau **améliore** f (moins d'hydrogène absorbant) mais
+dégrade p et surtout P_NL,rapide. L'effet net est fortement négatif. C'est
+exactement le mécanisme d'arrêt du réacteur.
+
+### 9.3 Coefficients de contre-réaction
+
+| coefficient | valeur |
+|---|---|
+| température (densité de l'eau) | **-98 pcm/K** |
+| vide | -7,4 pcm par kg de vapeur |
+| Doppler seul (inclus dans le précédent) | environ -2 pcm/K |
+| criticité exacte atteinte à | 610,2 K = 337,1 degC, soit 5,1 K sous l'ébullition |
+
+Un réacteur à eau pressurisée industriel a un coefficient modérateur de
+-10 à -50 pcm/K. Les -98 pcm/K d'Oklo s'expliquent par la proximité du point de
+saturation, où la masse volumique de l'eau varie le plus vite.
+
+---
+
+## 10. Validation, sensibilité, limites
+
+### 10.1 Validation de l'intégrateur
+
+`validation_cinetique()` — à rho = 1e-3 et Lambda = 3e-4 s :
+
+```
+période stable, équation inhour  : 55,3250 s
+période stable, 100 pas de 1 s   : 55,3249 s
+période stable, 1 pas de 100 s   : 55,3249 s
+écart relatif : 1e-6
+```
+
+L'égalité entre 1 pas et 100 pas est la preuve que l'intégration est exacte, et
+donc qu'elle n'amortit rien.
+
+### 10.2 Convergence en pas de temps
+
+`convergence_en_pas()` — 40 h simulées :
+
+| h_max | pas | marche | arrêt | P moyenne |
+|---|---|---|---|---|
+| 20,00 s | 7 205 | 31,00 min | 163,00 min | 15,13 kW |
+| 5,00 s | 28 801 | 31,17 min | 161,75 min | 15,06 kW |
+| 1,25 s | 38 401 | 31,12 min | 161,81 min | 15,07 kW |
+
+Convergé. Le réglage par défaut coûte 0,5 % sur la marche, 0,7 % sur l'arrêt.
+
+### 10.3 Sensibilité aux paramètres géologiques
+
+`etude_sensibilite()` — 30 h simulées par point :
+
+| paramètre | marche | arrêt | P moyenne |
+|---|---|---|---|
+| perméabilité 1e-13 m2 | 48 min | 76 min | 13,8 kW |
+| perméabilité 6e-14 m2 | 44 min | 88 min | 14,0 kW |
+| **perméabilité 3e-14 m2** | **32 min** | **159 min** | 13,4 kW |
+| perméabilité 1e-14 m2 | 30 min | 218 min | 14,8 kW |
+| k_eff(615 K) = 0,999 | 29 min | 154 min | 24,4 kW |
+| k_eff(615 K) = 0,997 | 30 min | 157 min | 19,1 kW |
+| **k_eff(615 K) = 0,995** | **32 min** | **159 min** | 13,4 kW |
+| k_eff(615 K) = 0,993 | 35 min | 166 min | 8,1 kW |
+
+Deux lectures importantes :
+
+- **La durée de marche est très robuste** : 29 à 48 min sur toute la plage
+  explorée, alors que la perméabilité varie d'un facteur 10 et la marge de
+  criticité d'un facteur 7 en réactivité.
+- **La durée d'arrêt est pilotée par la perméabilité**, et 150 min correspond à
+  un grès parfaitement banal (30 mD). C'est le seul paramètre qui déplace
+  vraiment le résultat, et il reste dans sa plage physique.
+- La marge de criticité ne déplace presque pas les durées (29 à 35 min /
+  154 à 166 min) mais déplace beaucoup la **puissance** (8 à 24 kW).
+
+### 10.4 Limites du modèle, à assumer
+
+**(a) Le cycle obtenu ne fait pas bouillir l'eau.** Le cœur oscille entre
+609,5 et 612,3 K, sous les 615,3 K de l'ébullition. La cyclicité vient de la
+dilatation de l'eau **liquide** avec retard hydraulique, et non du geyser à
+changement de phase invoqué par la littérature.
+
+Le régime diphasique est bien implémenté, et il s'active dès que l'on pousse la
+criticité au-dessus de l'ébullition. Avec K_MARGINAL = 1,0005 on obtient :
+
+| | régime liquide (retenu) | régime diphasique |
+|---|---|---|
+| k_eff(615 K, pores pleins) | 0,9950 | 1,0005 |
+| marche / arrêt | 31 min / 163 min | **10 min / 60 min** |
+| température maximale | 612,3 K | 615,3 K (saturation) |
+| vapeur formée | 0 kg | 1074 kg |
+| puissance de pointe | 0,24 MW | **108 MW** |
+| puissance moyenne | 16 kW | 27 kW |
+
+Le résultat est donc net, et il n'était pas attendu : **le régime bouillant
+donne des cycles quatre fois trop courts et des pointes de puissance de
+108 MW**, ce qui est intenable pour un objet ayant fonctionné 150 000 ans. Le
+mécanisme compatible avec l'enregistrement isotopique est celui de la
+dilatation de l'eau liquide, pas celui du geyser. C'est une conclusion du
+modèle, à discuter comme telle.
+
+**(b) epsilon = 1,02 est supposé, pas calculé.** Un calcul propre demanderait
+un traitement à plus de deux groupes d'énergie. Sans conséquence sur la
+dynamique (constante multiplicative absorbée par l'étalonnage), mais c'est la
+dernière constante non dérivée du modèle.
+
+**(c) Modèle 0D, pas de transport spatial.** Aucune redistribution du flux
+neutronique n'est modélisée. Pour un cœur dont l'aire de migration (20 cm) est
+comparable à la demi-épaisseur (35 cm), c'est une approximation forte : un
+calcul Monte-Carlo (MCNP, OpenMC) donnerait un k_eff différent de quelques
+pour cent. Cette incertitude est absorbée par l'étalonnage du réflecteur.
+
+**(d) Composition minéralogique supposée.** Les 8 % de Fe2O3 et 4 % de K2O de
+la matrice pèsent 9,7 % des absorptions thermiques. Une matrice moins ferrifère
+donnerait un k_eff plus élevé et un gain de réflecteur d'étalonnage plus
+faible. Cela ne change pas la dynamique.
+
+**(e) Pas d'usure du combustible.** L'U235 n'est pas consommé pendant la
+simulation. Sur 60 h c'est parfaitement justifié (0,0005 % du stock), mais cela
+signifie que le programme ne peut pas décrire l'évolution du réacteur sur
+150 000 ans. L'argument d'usure n'intervient que pour justifier la criticité
+marginale (4.6).
+
+**(f) Pas de xénon ni de samarium.** Le flux thermique vaut 5,5e8 n/cm2/s en
+moyenne et 8,4e9 au pic, soit **cinq ordres de grandeur sous celui d'un REP**
+(1e14). L'empoisonnement par le xénon 135 est proportionnel au flux : il est
+donc totalement négligeable ici, et l'équilibre xénon n'a de toute façon pas le
+temps de s'établir dans une bouffée de 30 min. Négligé à bon droit — c'est un
+point où l'intuition « réacteur industriel » induit en erreur.
+
+**(g) Le régime permanent est atteint après ~10 h simulées.** Les premiers
+cycles portent encore la marque des conditions initiales. C'est pourquoi
+`resume()` ne mesure que le dernier tiers.
+
+---
+
+## 11. Comparaison Programme 2 -> Programme 3
+
+### 11.1 Vue d'ensemble
+
+| | Programme 2 | Programme 3 |
+|---|---|---|
+| neutrons retardés | **absents** | 6 groupes de Keepin |
+| puissance résiduelle | absente | 6 groupes |
+| facteur f | constante ajustée 0,66 | calculé, 0,727 |
+| facteur p | 1, puis Doppler phénoménologique | formule homogène + Doppler |
+| epsilon | 1,0001 « car pas d'U238 » | 1,02 (96,5 % d'U238 dans le combustible) |
+| composition du cœur | non explicitée | 10 éléments, minéralogie complète |
+| source d'amorçage | 25 n/s (U235) | 3,6e5 n/s (U238) |
+| eau | densité par table NIST partiellement hors domaine | corrélation IAPWS |
+| thermique de l'encaissant | 1 nœud, quasi permanent | 30 mailles, transitoire |
+| hydraulique | absente | relaxation de Darcy |
+| pas de temps | fixe, 0,1 ms | adaptatif, 1e-6 s à 20 s |
+| intégration cinétique | Euler explicite | exponentielle de matrice (exacte) |
+| coût pour 60 h simulées | ~20 h de calcul (extrapolé) | **13 s** |
+| résultat | pas de cycle | **31 min / 163 min** |
+
+### 11.2 Les quatre erreurs qui rendaient l'objectif inatteignable
+
+**1. Absence de neutrons retardés.** C'est le point décisif. Avec beta = 0,
+toute la dynamique est gouvernée par Lambda = 1e-4 s : un réacteur à k = 1,01
+double sa puissance en 16 ms. Un cycle de 30 minutes est mathématiquement
+impossible dans ce cadre. Les neutrons retardés portent la période à la minute.
+
+**2. Source d'amorçage 1e4 fois trop faible, deux fois.**
+*Première fois* : `fission_spontanee` applique un taux à l'U235 seul, alors que
+c'est l'**U238** qui domine d'un facteur 1200 (6,8e-3 contre 5,7e-6
+fissions/g/s). On obtenait 25 n/s au lieu de 3,6e5.
+*Seconde fois* : dans `formule_cinetique_minimal` (ligne 163), `S_ext` est déjà
+exprimé *par génération* mais il est re-multiplié par `dt` = 1e-4.
+Conséquence : le réamorçage du réacteur était bloqué, ce qui était noté comme
+une difficulté dans le compte rendu.
+
+**3. Un flux traité comme une énergie** (`temperature_moderateur`, lignes
+244-245) :
+
+```python
+flux_thermique_vers_exterieur = 500
+perte = flux_thermique_vers_exterieur * (Tmoderateur - Tgres) * Vtot
+```
+
+`perte` est en watts (500 W/m3/K x delta_T x V) puis soustraite d'un `gain` en
+joules. Le facteur `* 10**(-4)` a disparu — il est resté dans la version
+commentée juste au-dessus, et dans `temperature_coeur`. **La perte du
+modérateur était 10 000 fois trop grande.**
+
+**4. Effet Doppler faux d'un facteur ~500, et appliqué au mauvais milieu.**
+
+```python
+p_eff = np.exp(-gamma*(Tmod**(1/2) - Tref**(1/2)))     # gamma = 0.069
+```
+
+Entre 293 K et 600 K cela fait chuter k de 40 %, soit environ 1300 pcm/K, alors
+que le Doppler réel vaut -2 à -3 pcm/K. De plus il dépend de la température du
+**combustible** (résonances de l'U238), pas du modérateur. Le p_0 = 0,95
+mentionné dans le compte rendu était absent du code.
+
+### 11.3 Les autres corrections
+
+| # | ligne (P2) | problème | correction |
+|---|---|---|---|
+| 5 | 263-267 | faute de frappe `temperature_finale` au lieu de `temp_finale` : la température reste au-dessus de l'ébullition | variable d'état unique (enthalpie), plus de branche |
+| 6 | 133 | `f = 0.66` constante ajustée | calculé depuis la composition |
+| 7 | 131 | `epsilon = 1.0001` « car absence de U238 » | il y a 96,5 % d'U238 ; c'est lui qui crée p |
+| 8 | 208 | âge de Fermi en 1/rho | en 1/(Sigma_tr . xi.Sigma_s), soit en 1/rho2 |
+| 9 | 209 | L proportionnel à rho^-1/2, donc L2 en 1/rho | L2 = D/Sigma_a, calculé |
+| 10 | 61 | B2 sans réflecteur : le terme axial (H = 0,70 m) vaut 20 m-2 et écrase tout | gain de réflecteur, B2 = 2,79 m-2 |
+| 11 | 230 | `capacite_th_UO2` en J/mol(UO2)/K multipliée par les moles d'**U235** seules : capacité sous-estimée d'un facteur 28 | masse d'UO2 x cp massique |
+| 12 | 187-192 | `coef_thermal` donne 96 % de thermalisation en liquide et 73 % en vapeur, au lieu des 95 %/15 % annoncés dans le compte rendu | remplacé par le traitement à deux groupes (P_NL rapide) |
+| 13 | 235-290 | l'eau modératrice est *dans* le cœur pour la neutronique mais sa température est celle de l'argile *hors* du cœur | un seul milieu cœur = UO2 + matrice + eau |
+| 14 | 92-93 | table NIST : 649 et 613 kg/m3 à 613 et 623 K, alors qu'à 150 bar T_sat = 615,3 K et rho_liq,sat = 603 kg/m3 (points hors domaine) | corrélation IAPWS de saturation |
+| 15 | 329/335 | `T_ebullition` défini deux fois dans `test()` (638 puis 615) ; `rho_liq_eb` vaut 603 au module et 732 dans `test()` | constantes uniques |
+| 16 | 124/145 | `Tcoeur` est un argument de `criticite()` et `formule_cinetique_minimal()` mais n'est jamais utilisé | `T_combustible` sert au Doppler |
+| 17 | 47/312 | `neutrons_produits` est une liste globale mutée dans `test()` : deux appels successifs ne repartent pas du même état | aucun état global mutable dans la boucle |
+| 18 | 9/55 | lentille de 12 x 7 m modélisée par un cylindre de R = 2,10 m : volume divisé par 6, fuites radiales surestimées | R = 5,17 m (même empreinte) |
+| 19 | 221-225 | `surface`, `conduct_UO2`, `tab_rho_eff`, `import random`, `n_vitesse`, `section_efficace_totale` : calculés ou déclarés, jamais utilisés | supprimés |
+| 20 | 48/124 | `criticite = 0` (variable) puis `def criticite(...)` : collision de noms | noms distincts |
+
+### 11.4 Ce que le programme 2 avait déjà juste
+
+Il faut le dire : la structure physique était la bonne.
+
+- L'idée que **l'eau est à la fois modérateur et organe de contrôle** est
+  correcte, et c'est le cœur du sujet.
+- Le choix de la formule des six facteurs est le bon niveau de modélisation
+  pour un TIPE.
+- La fraction de vapeur comme variable d'état supplémentaire est la bonne
+  intuition (elle est conservée, sous forme d'enthalpie).
+- Les bilans d'énergie par fission (194,6 MeV au cœur, 21,5 MeV au modérateur,
+  décroissance des produits de fission à 7 %) sont corrects et repris tels
+  quels.
+- Le diagnostic porté dans le compte rendu (« la température du modérateur
+  n'augmente pas assez », « le réamorçage est bloqué », « k_eff > 1 dans les
+  deux cas ») pointait exactement les bons symptômes.
+
+### 11.5 Deux corrections pour le compte rendu
+
+- « 6,25 kW donc 1e15 fissions par minute » : 6,25 kW donne ~1,2e16
+  fissions/min. Le chiffre pour 100 kW (1e17/min) est cohérent ; c'est la
+  division par 16 qui a glissé d'une décade.
+- « p = 1 car pas de poisons, pas d'U238 » puis « epsilon proche de 1 car
+  absence d'U238 » : le combustible est à 96,5 % d'U238. C'est lui qui donne
+  p = 0,826 et le Doppler.
+
+---
+
+## 12. Mode d'emploi
+
+### 12.1 Exécution normale
+
+```
+python Programme_Final_3.py
+```
+
+Enchaîne : étalonnage du réflecteur, bilan du modèle, simulation de 60 h
+(environ 13 s de calcul), tableau de comparaison avec Oklo, deux figures.
+
+### 12.2 Les vérifications à montrer au jury
+
+Décommenter en bas du fichier, ou dans une console :
+
+```python
+import Programme_Final_3 as m
+m.calibrer_reflecteur()
+
+m.validation_cinetique()    # l'intégrateur est exact           (instantané)
+m.convergence_en_pas()      # le résultat ne dépend pas du pas   (~3 min)
+m.etude_sensibilite()       # le résultat n'est pas un réglage   (~2 min)
+```
+
+### 12.3 Explorer
+
+Toutes les grandeurs sont des variables de module. Pour changer un paramètre
+géologique, il faut penser à ré-étalonner :
+
+```python
+m.PERMEABILITE = 1e-14      # arrêt plus long
+m.calibrer_reflecteur()     # obligatoire après tout changement de composition
+res = m.simuler(duree=30*3600)
+marches, arrets, periodes = m.analyser_cycles(res)
+m.resume(res, marches, arrets, periodes)
+```
+
+Attention : changer `POROSITE`, `R_COEUR` ou `E_GRES` demande de reconstruire
+les grandeurs dérivées (`N_SOLIDE`, `V_PORES`, table d'enthalpie, maillage).
+Le plus simple est de modifier la constante en tête de fichier et de relancer.
+
+### 12.4 Paramètres de `simuler()`
+
+| paramètre | défaut | rôle |
+|---|---|---|
+| `duree` | 24 h | durée simulée, en secondes |
+| `tol` | 6e-3 | variation de réactivité tolérée par pas, en unités de beta |
+| `h_max` | 20 s | pas maximal ; 5 s pour un résultat convergé à 0,1 % |
+| `dt_enreg` | 3 s | intervalle d'échantillonnage des résultats |
+| `verbose` | True | affiche le nombre de pas et le temps de calcul |
+
+### 12.5 Dépendances
+
+`numpy` et `matplotlib` uniquement. Pas de `scipy` : l'intégrateur, le solveur
+tridiagonal et les dichotomies sont écrits explicitement, ce qui est
+préférable pour un TIPE (rien n'est délégué à une boîte noire).
+
+---
+
+## Annexe A — Les hypothèses en une page
+
+| # | hypothèse | justification | impact si fausse |
+|---|---|---|---|
+| H1 | lentille = cylindre de même empreinte | seule la forme entre, via B2, dominé par le terme axial | faible |
+| H2 | cœur homogène (0D) | grains millimétriques contre M = 20 cm | modéré (k_eff à quelques % près) |
+| H3 | pas de poison dissous | eau renouvelée, hypothèse de la littérature | absorbé par l'étalonnage |
+| H4 | un groupe thermique + P_NL rapide | modèle standard des réacteurs thermiques | modéré |
+| H5 | spectre maxwellien à T_modérateur | vrai pour un réacteur bien modéré | faible |
+| H6 | combustible et modérateur à la même température | 0,3 kW/m3 contre 100 MW/m3 dans un REP | faible (rend le Doppler marginal) |
+| H7 | cp de l'eau tabulé | données IAPWS | faible |
+| H8 | conduction pure dans l'encaissant | pas de convection modélisée | absorbé par `E_GRES` |
+| H9 | pas d'usure du combustible | 0,0005 % du stock sur 60 h | nul sur 60 h |
+| H10 | pas de xénon ni samarium | flux 5 ordres de grandeur sous un REP | négligeable |
+| H11 | epsilon = 1,02 constant | milieu très dilué en uranium | absorbé par l'étalonnage |
+| H12 | vapeur en équilibre mécanique dans les pores | volume de pore fixe | non sollicitée (pas d'ébullition ici) |
+
+## Annexe B — Fichiers
+
+| fichier | contenu |
+|---|---|
+| `Programme_Final_2.py` | version précédente, conservée pour comparaison |
+| `Programme_Final_3.py` | modèle actuel |
+| `DOCUMENTATION.md` | ce document |
+| `fig_1.png` | vue d'ensemble sur 60 h + portrait de phase |
+| `fig_2.png` | zoom sur un cycle |
+
+## Annexe C — Sources
+
+- Lamarsh & Baratta, *Introduction to Nuclear Engineering*, 3e éd.
+  (chapitres 5 et 6 pour les six facteurs, chapitre 3 et p. 409-414 pour le
+  bilan d'énergie par fission)
+- Comptes rendus Géoscience de l'Académie des sciences, dossier Oklo
+  (composition du minerai, fraction volumique d'uraninite, porosités)
+- Meshik, Hohenberg & Pravdivtseva, *Record of Cycling Operation of the Natural
+  Nuclear Reactor in the Oklo/Okelobondo Area*, Phys. Rev. Lett. 93 (2004)
+  (les 30 min / 2 h 30 déduits des isotopes du xénon)
+- IAPWS-IF97 (masse volumique et chaleur latente de l'eau à 150 bar)
+- Keepin, données des six groupes de neutrons retardés de l'U235
+- USGS Open-File Report 88-441 (conductivités thermiques des roches et argiles)
