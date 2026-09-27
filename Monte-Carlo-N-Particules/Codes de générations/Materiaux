@@ -1,0 +1,40 @@
+import openmc
+
+#Cœur : U235 pur à faible densité
+# 158.6 kg dans un cylindre R=210cm, H=70cm
+# Volume = pi * 210² * 70 = 9,699,690 cm³
+# Densité = 158600g / 9699690 cm³ ≈ 0.016351 g/cm³
+core = openmc.Material(name='U235 pur')
+core.add_nuclide('U235', 1.0)
+core.set_density('g/cm3', 0.016351)
+
+#Réflecteur latéral : conglomérat SiO2 + eau (15% porosité)
+# Composition volumique : 85% SiO2 (rho=2.65) + 15% eau (rho=1.0)
+# Densité effective = 0.85*2.65 + 0.15*1.0 = 2.4025 g/cm³
+lateral_reflector = openmc.Material(name='Conglomerat')
+lateral_reflector.add_nuclide('Si28', 0.85, percent_type='vo')
+lateral_reflector.add_nuclide('O16',  0.85*2 + 0.15, percent_type='vo')  # O du SiO2 + O de l'eau
+lateral_reflector.add_nuclide('H1',   0.15*2, percent_type='vo')         # H de l'eau
+lateral_reflector.set_density('g/cm3', 2.4025)
+
+#Réflecteur haut/bas : argile kaolinite + eau (10% porosité)
+# Kaolinite : Al2Si2O5(OH)4, rho=2.6 g/cm³
+# Densité effective = 0.90*2.6 + 0.10*1.0 = 2.44 g/cm³
+axial_reflector = openmc.Material(name='Argile kaolinite')
+axial_reflector.add_nuclide('Al27', 0.90*2, percent_type='vo')           # 2 Al par formule
+axial_reflector.add_nuclide('Si28', 0.90*2, percent_type='vo')           # 2 Si par formule
+axial_reflector.add_nuclide('O16',  0.90*9 + 0.10, percent_type='vo')   # 9 O kaolinite + O eau
+axial_reflector.add_nuclide('H1',   0.90*4 + 0.10*2, percent_type='vo') # 4 H kaolinite + 2H eau
+axial_reflector.set_density('g/cm3', 2.44)
+
+#Exportation
+materials = openmc.Materials([core, lateral_reflector, axial_reflector])
+materials.export_to_xml()
+
+print("Matériaux exportés avec succès !")
+for mat in materials:
+    print(f"\n{mat.name} — densité : {mat.density} g/cm³")
+    for nuc, percent, ptype in mat.nuclides:
+        print(f"  {nuc} : {percent}")
+
+
