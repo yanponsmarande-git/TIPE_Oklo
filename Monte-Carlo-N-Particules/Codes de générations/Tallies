@@ -1,0 +1,54 @@
+tallies = openmc.Tallies()
+
+# Filtre sur la cellule du cœur
+cell_filter = openmc.CellFilter(cell_core)
+
+# Filtre en énergie : deux groupes comme ton modèle déterministe
+# Thermiques : 0 → 1 eV
+# Rapides    : 1 eV → 20 MeV
+energy_filter = openmc.EnergyFilter([0.0, 1.0, 20.0e6])  # en eV
+
+# --- Tally 1 : Taux de fission dans le cœur
+tally_fission = openmc.Tally(name='Taux de fission')
+tally_fission.filters = [cell_filter]
+tally_fission.scores = ['fission']
+tallies.append(tally_fission)
+
+# --- Tally 2 : Flux par groupe d'énergie dans le cœur
+tally_flux = openmc.Tally(name='Flux par groupe')
+tally_flux.filters = [cell_filter, energy_filter]
+tally_flux.scores = ['flux']
+tallies.append(tally_flux)
+
+# --- Tally 3 : Distribution spatiale radiale du flux
+mesh = openmc.CylindricalMesh(
+    r_grid=[i*10 for i in range(22)],  # 0, 10, 20, ..., 210 cm
+    z_grid=[-35.0, 35.0],              # toute la hauteur du cœur
+    phi_grid=[0, 2*3.14159]            # 360°
+)
+
+#J'ai fini par rajouter deux tallies : 
+
+mesh_filter = openmc.MeshFilter(mesh)
+tally_spatial = openmc.Tally(name='Flux spatial radial')
+tally_spatial.filters = [mesh_filter]
+tally_spatial.scores = ['flux']
+tallies.append(tally_spatial)
+
+# --- Tally 4 : Energie dans le coeur ---
+tally_heating = openmc.Tally(name='Depot energie coeur')
+tally_heating.filters = [cell_filter]
+tally_heating.scores = ['heating']
+tally.append(tally_heating)
+
+# --- Tally 5 : Energie dans le reflecteur/moderateur ---
+reflecteur_filter = openmc.CellFilter([cell_lat,cell_bas,cell_haut])
+tally_heating_ref = openmc.Tally(name='Depot energie reflecteurs')
+tally_heating_ref.filters = [reflecteur_filter]
+tally_heating_ref.scores = ['heating']
+tally.append(tally_heating_ref)
+
+
+tallies.export_to_xml()
+
+
