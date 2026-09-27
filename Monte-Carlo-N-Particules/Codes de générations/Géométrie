@@ -1,0 +1,50 @@
+
+##Définition des surfaces : 
+# Cœur : cylindre vertical R=210cm, H=70cm (centré à l'origine)
+cyl_core      = openmc.ZCylinder(r=210.0)
+plan_bas_core = openmc.ZPlane(z0=-35.0)
+plan_haut_core = openmc.ZPlane(z0=+35.0)
+
+# Réflecteur latéral : même hauteur que le cœur, épaisseur = 70cm (= hauteur du cœur, comme dans l'article)
+cyl_lat = openmc.ZCylinder(r=280.0)  # 210 + 70 = 280 cm
+
+# Réflecteurs haut et bas : épaisseur = 70cm
+plan_bas_ax  = openmc.ZPlane(z0=-105.0, boundary_type='vacuum')  # -35 - 70
+plan_haut_ax = openmc.ZPlane(z0=+105.0, boundary_type='vacuum')  # +35 + 70
+
+# Frontière extérieure latérale
+cyl_ext = openmc.ZCylinder(r=280.0, boundary_type='vacuum')
+
+## Définition des cellules : 
+
+# Cœur
+cell_core = openmc.Cell(name='Coeur')
+cell_core.region = -cyl_core & +plan_bas_core & -plan_haut_core
+cell_core.fill = core
+
+# Réflecteur latéral (anneau autour du cœur, même hauteur)
+cell_lat = openmc.Cell(name='Reflecteur lateral')
+cell_lat.region = +cyl_core & -cyl_lat & +plan_bas_core & -plan_haut_core
+cell_lat.fill = lateral_reflector
+
+# Réflecteur inférieur
+cell_bas = openmc.Cell(name='Reflecteur inferieur')
+cell_bas.region = -cyl_lat & +plan_bas_ax & -plan_bas_core
+cell_bas.fill = axial_reflector
+
+# Réflecteur supérieur
+cell_haut = openmc.Cell(name='Reflecteur superieur')
+cell_haut.region = -cyl_lat & +plan_haut_core & -plan_haut_ax
+cell_haut.fill = axial_reflector
+
+## Univers et géométrie :
+universe = openmc.Universe(cells=[cell_core, cell_lat, cell_bas, cell_haut])
+geometry = openmc.Geometry(universe)
+geometry.export_to_xml()
+
+print("Géométrie exportée avec succès !")
+print(f"\nCœur         : R=210cm, H=70cm")
+print(f"Réfl. latéral : épaisseur 70cm (R=210→280cm)")
+print(f"Réfl. haut/bas: épaisseur 70cm")
+
+
