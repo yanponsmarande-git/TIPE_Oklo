@@ -31,7 +31,7 @@ axial_reflector.set_density('g/cm3', 2.44)
 materials = openmc.Materials([core, lateral_reflector, axial_reflector])
 materials.export_to_xml()
 
-print("Matériaux exportés avec succès !")
+# Affichage et vérification :
 for mat in materials:
     print(f"\n{mat.name} — densité : {mat.density} g/cm³")
     for nuc, percent, ptype in mat.nuclides:
