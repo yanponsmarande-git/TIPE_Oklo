@@ -1,0 +1,26 @@
+settings = openmc.Settings()
+
+# Type de calcul : criticité (k-eigenvalue)
+settings.run_mode = 'eigenvalue'
+
+# Nombre de neutrons par cycle
+settings.particles = 10000
+
+# Nombre de cycles actifs (ceux dont les résultats sont conservés)
+settings.batches = 150
+
+# Nombre de cycles inactifs (pour converger la source avant de collecter)
+settings.inactive = 50
+
+# Source initiale de neutrons : uniforme dans le cœur
+# On démarre les neutrons dans un cylindre correspondant au cœur
+bounds = [-210, -210, -35, 210, 210, 35]
+uniform_dist = openmc.stats.Box(bounds[:3], bounds[3:], only_fissionable=True)
+settings.source = openmc.IndependentSource(space=uniform_dist)
+
+settings.export_to_xml()
+
+print("Settings exportés avec succès !")
+print(f"\nNeutrons par cycle : {settings.particles}")
+print(f"Cycles inactifs    : {settings.inactive}")
+print(f"Cycles actifs      : {settings.batches - settings.inactive}")
