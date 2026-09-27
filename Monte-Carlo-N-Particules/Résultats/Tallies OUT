@@ -1,0 +1,95 @@
+===================>     TALLY 1: TAUX DE FISSION     <====================
+
+ Cell 1
+   Total Material
+     Fission Rate                         0.437039 +/- 0.000504557
+ ===================>     TALLY 2: FLUX PAR GROUPE     <====================
+
+ Cell 1
+   Incoming Energy [0, 1)
+     Total Material
+       Flux                                 22.0287 +/- 0.0243643
+   Incoming Energy [1, 20000000)
+     Total Material
+       Flux                                 37.8665 +/- 0.0214427
+ =================>     TALLY 3: FLUX SPATIAL RADIAL     <==================
+
+ Mesh Index (1, 1, 1)
+   Total Material
+     Flux                                 0.262354 +/- 0.00404699
+ Mesh Index (2, 1, 1)
+   Total Material
+     Flux                                 0.813049 +/- 0.00995765
+ Mesh Index (3, 1, 1)
+   Total Material
+     Flux                                 1.36004 +/- 0.0117319
+ Mesh Index (4, 1, 1)
+   Total Material
+     Flux                                 1.90031 +/- 0.0150519
+ Mesh Index (5, 1, 1)
+   Total Material
+     Flux                                 2.4177 +/- 0.0178177
+ Mesh Index (6, 1, 1)
+   Total Material
+     Flux                                 2.86884 +/- 0.0144297
+ Mesh Index (7, 1, 1)
+   Total Material
+     Flux                                 3.27607 +/- 0.014994
+ Mesh Index (8, 1, 1)
+   Total Material
+     Flux                                 3.5707 +/- 0.0222249
+ Mesh Index (9, 1, 1)
+   Total Material
+     Flux                                 3.80171 +/- 0.0201438
+ Mesh Index (10, 1, 1)
+   Total Material
+     Flux                                 4.04904 +/- 0.0199297
+ Mesh Index (11, 1, 1)
+   Total Material
+     Flux                                 4.22598 +/- 0.0156421
+ Mesh Index (12, 1, 1)
+   Total Material
+     Flux                                 4.29997 +/- 0.0181583
+ Mesh Index (13, 1, 1)
+   Total Material
+     Flux                                 4.25847 +/- 0.0169703
+ Mesh Index (14, 1, 1)
+   Total Material
+     Flux                                 4.14658 +/- 0.0173397
+ Mesh Index (15, 1, 1)
+   Total Material
+     Flux                                 3.91442 +/- 0.0156813
+ Mesh Index (16, 1, 1)
+   Total Material
+     Flux                                 3.60778 +/- 0.0128282
+ Mesh Index (17, 1, 1)
+   Total Material
+     Flux                                 3.24225 +/- 0.0169448
+ Mesh Index (18, 1, 1)
+   Total Material
+     Flux                                 2.76963 +/- 0.0172013
+ Mesh Index (19, 1, 1)
+   Total Material
+     Flux                                 2.23235 +/- 0.017801
+ Mesh Index (20, 1, 1)
+   Total Material
+     Flux                                 1.68876 +/- 0.0152254
+ Mesh Index (21, 1, 1)
+   Total Material
+     Flux                                 1.13185 +/- 0.0112122
+ =================>     TALLY 4: DEPOT ENERGIE COEUR     <==================
+
+ Cell 1
+   Total Material
+     heating                              7.54679e+07 +/- 85386.4
+ ==============>     TALLY 5: DEPOT ENERGIE REFLECTEURS     <===============
+
+ Cell 2
+   Total Material
+     heating                              9002.52 +/- 171.416
+ Cell 3
+   Total Material
+     heating                              55096.8 +/- 415.112
+ Cell 4
+   Total Material
+     heating                              54862.4 +/- 499.485
