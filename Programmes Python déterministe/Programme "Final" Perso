@@ -1,0 +1,458 @@
+## Description : Modélisation du réacteur 9 d'Oklo avec pour objectif de simuler sa cyclicité.
+
+import random as rd
+import numpy as np
+import matplotlib.pyplot as plt
+
+## Hypothèses (impossibilité de définir de l'incertitude) :
+
+# Géométrie du coeur : modèle : cyclindre de rayon 210cm et 70cm d'épaisseur.
+# Géométrie du coeur + argile (modérateur/reflecteur_superieurs) : cylindre de rayon 210cm et 210cm d'épaisseur.
+# Homogénéité du coeur et du modérateur, déplétion du combustible homogène.
+# Fraction volumique en eau (modérateur) dans le coeur : 30%
+# Densité uniforme du noyau et des réflecteurs.
+# Discrétisation du temps en générations pour une résolution/intégration par la méthode d'Euler.
+# Une génération correspond à 0.1 ms simulée.
+# Simulation de transport spatial non modélisé : modèle 0D.
+# Neutronique du réacteur thermique cylindrique fini à deux groupes, formule classique à 6 facteurs.
+# Cinétique neutronique point sans neutrons retardés
+# Amorçage par fission spontanée.
+
+## Phénomènes négligés
+
+#On néglige les neutrons retardés.
+#On néglige les produits des réaction nucléaires (xénon, samarium) ainsi que leur impacte sur la production et consommation de neutrons, donc une part des poisons neutroniques.
+
+#-------------------------------------------------------------------------#
+
+# Définition des constantes :
+
+n_eV = [0.0253, 4.6*10**9, 5*10**9]     #energie des neutrons thermalisés, neutrons produits de désintégration, energie total des neutrons de fission, en eV
+taux_fission = 1.6*10**(-4)             #fissions spontanées par gramme par seconde
+n_cree_moy = 2.47                       #nombre moyen de neutrons produits par fissions
+section_efficace_f_init = [585, 1.2]   # en barns (10**-24 cm-2) en fonction de l'energie du neutron.
+section_efficace_abs = [680,1.29]
+section_efficace_totale = [700,5]       # même chose
+gamma = 0.069                           # facteur élargissement Doppler pour l'U238.
+#
+masse_mol_U5 = 0.235                    #en kg.mol-1
+avogadro = 6.02214*10**23               #en mol-1
+
+t_g_n = 10**(-4)                        #temps de génération neutronique par seconde
+
+# Définition de variables : T en générations, M en g, L en cm, T en K, P en Pa, conductivité en W.m-1.K-1
+
+#Relatif aux neutrons
+
+neutrons_produits = [0,1]   #à la k-ième génération : à différentes energies (eV), thermique, désintegration.
+criticite = 0               #criticité vaut le rapport du nombre de neutrons produits sur le nombre perdus sur une génération
+
+n_fission = [0,1]           #nombre de fissions à la (k-1)-ième géné et à la k-ème géné, initialisé à 1 neutron pour accélerer l'amorçage.
+
+#Relatif à l'environment
+
+distance_moy = 0.7875  # distance moyenne entre un point aléatoire du coeur et une extremité.
+R = 2.1
+H = 0.7
+fraction_laterale =  2*np.pi*R*H /  (2*np.pi*R*H + 2*np.pi*R**2)
+surface_coeur = (2*np.pi*R**2)*2 + 2*np.pi*R*H
+S_lat = H*2*np.pi*R
+S_vert = 2*np.pi*R**2   #tout est en m2
+B2 = (2.405/R)**2+(np.pi/H)**2  #calcul Buckling géométrique en m-2
+Text = 273.15 + 25      #au cas où je décide de ne pas considérer le grès comme thermostat
+
+Tgres = 273.15 + 150
+conduct_gres = 3
+
+P = 150 #pression hydrostatique en bar
+
+#Températures en Kelvin et masse volumiques en kg/m3
+T_moderateur = 273.15 + 150
+T_coeur = 273.15 + 150
+densite_eau = 0.9232
+rho_liq_eb = 603
+rho_vap_eb = 96
+T_ebullition = 615
+vapeur_eau = False          #vrai si l'eau est vaporisée
+frac_vap = 0.0  #fraction de vapeur d'eau dans le moderateur compris entre 0 et 1.
+
+porosite_refl_lateral = 0.15
+conduct_conglo = 0.3
+
+porosite_refl_sup_inf = 0.1
+conduct_argile = 1.3
+capacite_th_argile = 1350       # J.kg-1.K
+rho_argile = 1700*0.9 + 997*0.1 #kg.m-3
+
+Vtot = (np.pi*R**2)*H #en m3
+
+densite_tot = 16.35   #en kg.m-3
+atomes_U235 = ((densite_tot * Vtot) / masse_mol_U5) * avogadro #nombre d'atomes d'U235 dans le coeur
+#TABLEAU des densités de l'eau en kg/m3 à 150 bar en fonction de la température en Kelvin d'après le NIST Webook.
+T_NIST = np.array([273.16 + 10*i for i in range(36)])
+RHO_NIST = np.array([1007,1006,1004,1002,998,994,989,984,978,971,965,957,950,942,933,925,915,906,896,885,874,862,850,838,825,811,796,780,763,745,725,703,678,649,613,603])
+
+#------------------------------------------------------------------------------#
+## Fonctions
+
+#Relatif aux calculs sur une génération, dans la section S du cylindre
+
+def crit(n_1 : int,n_2 : int) -> int:
+    """Renvoie la criticité du réacteur à un instant en fonction du nombre de neutrons générés entre deux générations"""
+
+    return n_1/n_2
+
+
+def fission_spontanee(n):
+    """Renvoie le nombre de fissions spontanées ainsi que le nombre de noyaux restant après une génération, en fonction du nombre de noyaux actifs."""
+
+    taux = (masse_mol_U5* taux_fission*1000)/avogadro   # fissions par seconde par atome d'U235
+    nb_fissions = n*taux*10**(-4)
+
+    return ( nb_fissions , n - nb_fissions)
+
+##
+
+def section_efficace_fission_reelle(Tmod,eV): #modèlise l'effet de la température sur la section efficace de fission pour les neutrons thermiques en particulier.
+    """Renvoie la section efficace de fission réelle en fonction de la température du modérateur en Kelvin et de l'energie des neutrons"""
+    Tref = 293.6 # Kelvin
+    if eV == 0:    #si les neutrons sont thermiques, alors on a l'approximation 1/sqrt(T)
+         return(section_efficace_f_init[0]*np.sqrt(Tref/Tmod)*10**(-24))
+    else :
+        return(section_efficace_f_init[1]*10**(-24))
+
+def criticite(Tcoeur, Tmod, frac_vap):
+    """Renvoie le facteur multiplicatif effectif et le facteur antitrappe effectif du réacteur, en fonction des températures et de la fraction de neutrons rapides."""
+    Tref = 293.6
+    rho_eff = densite_effective(Tmod, frac_vap)
+    alpha = coef_thermal(rho_eff)
+
+    #epsilon le facteur de fission rapide.
+    epsilon = 1.0001 #car absence de U238 et fissions rapides négligeables.
+    #f facteur d'utilisation thermique.
+    f = 0.66 # constante ajusté qui devrait être calculé d'après la composition du coeur (et corrigé par une absorption supplémentaire de 5% par la gangue).
+    #etha le facteur de reproduction.
+    sigma_th_abs,sigma_rapide_abs = section_efficace_abs[0]*10**(-24)*(293/Tmod)**(1/2), section_efficace_abs[1]*10**(-24)
+    etha =  n_cree_moy * (alpha*section_efficace_fission_reelle(Tmod,0)+ (1-alpha)*section_efficace_fission_reelle(Tmod,1))/(sigma_th_abs*alpha + sigma_rapide_abs*(1-alpha))
+    # p le facteur "antitrappe" de ralentissement (résonance U238)
+    p_eff =  np.exp(-gamma*(Tmod**(1/2)-Tref**(1/2)))
+
+    # P_NL les facteurs de non-fuites
+    P_NL_th,P_NL_r = calcul_PNL(rho_eff)
+    k_eff = etha * epsilon * f * p_eff * P_NL_th * P_NL_r
+    return(tuple((k_eff, rho_eff)))
+
+def formule_cinetique_minimal(Tcoeur, Tmod, k_eff, N0, rho_eff):
+    """Renvoie le nombre de fissions, de neutrons produits
+    selon la thermalisation,
+    en fonction des températures et de caracteristiques efficace"""
+    dt = 10**(-4)
+    S_ext = fission_spontanee(atomes_U235)[0]*2.43  #neutrons par fission spontanée par générations
+    G = dt/t_g_n    #temps caracteristiques sur une génération
+    alpha = coef_thermal(rho_eff)
+    #
+    sigma_th,sigma_rapide = section_efficace_fission_reelle(Tmod,0),section_efficace_fission_reelle(Tmod,1)
+    sigma_th_abs,sigma_rapide_abs = section_efficace_abs[0]*10**(-24)*(293/Tmod)**(1/2), section_efficace_abs[1]*10**(-24)
+    poids_th = alpha * sigma_th
+    poids_rapide  = (1-alpha) * sigma_rapide
+    poids_tot = poids_th + poids_rapide
+    sigma_f_eff = poids_th + poids_rapide
+    sigma_abs_eff = sigma_th_abs*alpha + sigma_rapide_abs * (1-alpha)
+    rapport = sigma_f_eff/sigma_abs_eff
+    #
+    N_produits = N0 + dt * (N0* (k_eff - 1) / t_g_n + S_ext)
+    F_total = N0 * G * rapport
+    #
+
+    F_th = F_total * poids_th / poids_tot
+    F_rapide  = F_total * poids_rapide  / poids_tot
+
+
+    N_th_suivant = alpha* N_produits
+    N_rap_suivant  = (1-alpha)* N_produits
+
+    return(F_th,F_rapide, N_th_suivant, N_rap_suivant)
+
+##
+# Test : n_fissions( 300, 0.05)
+##
+
+def verif_vapeur(Tmod):
+    """Renvoie vrai si l'eau est vaporisé, faux sinon, en fonction de sa température en Kelvin"""
+    if Tmod >= T_ebullition:
+        return True
+    else: return False
+
+
+def coef_thermal(rho_eau): #Possibilité de rendre continu et pas binaire
+    """renvoie la fraction de thermalisation de n'import quel flux
+    neutronique en fonction de la densité du modérateur, donc de l'état physique de l'eau, donc de sa température."""
+
+    lambda_th  = 2.85*10**(-2) * (1000/rho_eau)
+    return (1/(1+lambda_th/distance_moy))
+
+def masse_vol_eau_liq(T):
+    """Renvoie la densité de l'eau par interpolation des données du NIST Webook, en kg/m3 en fonction de la température """
+    T_clippee = np.clip(T,T_NIST[0],T_NIST[-1])  #assure l'appartenance à l'intervalle de validité (273 K à 638 K)
+    return(float(np.interp(T_clippee,T_NIST,RHO_NIST)))
+
+def densite_effective(Tmoderateur, frac_vap):
+    """Renvoie la densite moyenne/effective du mélange vapeur/liquide de l'eau en fonction de la température du modérateur et de la fraction de vapeur"""
+    rho_liq = masse_vol_eau_liq(min(Tmoderateur,T_ebullition))
+    rho_vap = rho_vap_eb
+    return ((1 - frac_vap)*rho_liq + frac_vap*rho_vap)
+
+
+def calcul_PNL(rho_eau):
+    """Renvoie les facteur de non fuites thermique et rapide en fonction de la densité de l'eau"""
+    tau = 27*10**(-4) * (1000/rho_eau)
+    L = 2.85*10**(-2)*(1000/rho_eau)**(1/2)
+    P_NL_r = np.exp(-B2* tau)
+    P_NL_th = 1/(1+ B2 * L**2)
+    return(P_NL_th,P_NL_r)
+
+
+def temperature_coeur(nb,Tcoeur, Tmoderateur):
+    """Renvoie la température dans le coeur en fonction du nombre de fissions
+    pendant la génération, ainsi que les températures précédentes des différents
+    milieux. Renvoie aussi l'energie thermique transmise au modérateur"""
+    to = Tcoeur/1000
+    h_vol = 200 # W.m-3.K-1
+    surface = surface_coeur - 2*np.pi*2.1*0.7 #surface en contact seulement avec l'argile
+    masse_argile = rho_argile * Vtot * 0.95 # car 95% du volume du coeur est de la roche plutot que le l'uraninite.
+     #en W.m-1.K-1
+    capacite_th_UO2 = 52.17 + 88*to - 84.2*to**2 +31.5*to**3 -2.6*to**4 -0.7*to**(-2) #en J.mol-1.K-1
+    conduct_UO2 = 100/(7.5 + 17.7*to + 3.6*to**2) + (6400*np.exp(-16.35/to))/to**(5/2)
+    gain = nb * 3.12*10**(-11) # 194.6 MeV absorbé par fission,en Joules.
+    flux_thermique_vers_exterieur = (Tcoeur - Tmoderateur) * h_vol * Vtot
+    perte = flux_thermique_vers_exterieur * 10**(-4) # en Joules
+
+    temp_finale = (gain - perte)/(masse_argile*capacite_th_argile + atomes_U235*capacite_th_UO2/avogadro) + Tcoeur
+    """print("T = ",temp_finale, "capacite_UO2 = ",capacite_th_UO2,"conduct_UO2 = ",conduct_UO2)"""
+    return (temp_finale,perte)
+
+
+def temperature_moderateur(e_recu, nb, Tmoderateur, frac_vap):
+    """Renvoie la température du modérateur (argile/eau) et la fraction vaporisée en fonction en fonction de l'energie thermique provenant du coeur, du nombre de fissions, de son ancienne température et de la fraction vaporisée."""
+    surface = surface_coeur - 2*np.pi*2.1*0.7 + 2*np.pi*2.1 #la surface qui sépare l'argile du grès.
+    Vmod = (np.pi*2.1**2* 1.7 - Vtot)
+    gain = e_recu + nb *3.4*10**(-12) # 21.5 MeV absorbé par fission en plus de l'energie transmise par le coeur, en Joules.
+
+    """flux_thermique_vers_exterieur = (conduct_gres*surface)*(Tmoderateur - Tgres)/ 2.5 #en Joule par seconde
+    perte = flux_thermique_vers_exterieur * 10**(-4) #en Joule"""
+
+    flux_thermique_vers_exterieur = 500
+    perte = flux_thermique_vers_exterieur * (Tmoderateur - Tgres) * Vtot
+
+    rho_eau = densite_effective(Tmoderateur,frac_vap)
+    volume_eau = Vmod*0.3 #en m3 pour une fraction volumique de 30%
+    masse_eau = volume_eau * rho_eau
+    cp_eau = 4215
+
+    masse_argile = rho_argile * Vmod * 0.95 * 0.7 #même chose que pour le coeur sauf que la porosité de l'argile (où se situe l'eau) est prit en compte.
+    capacithe_mod_tot = masse_argile*capacite_th_argile + masse_eau * cp_eau    # en J/K
+    bilan = gain - perte
+    #gestion du changement de phase de l'eau.
+    #phase liquide :
+    L_vap = 10**6   # chaleur latente à 150 bar et 342deg Celsius, en J/kg
+    if Tmoderateur < T_ebullition and frac_vap == 0.0 :
+        temp_finale = bilan/(capacithe_mod_tot) + Tmoderateur
+        frac_vap_finale = 0.0
+        #declanchement de la vaporisation :
+        if temp_finale >= T_ebullition:
+            Q_chauffage = capacithe_mod_tot *(T_ebullition -Tmoderateur)
+            Q_restant = bilan - Q_chauffage
+            frac_vap_finale = min(Q_restant/(masse_eau*L_vap),1.0)
+            frac_vap_finale = max(frac_vap_finale,0.0)
+            temperature_finale = T_ebullition
+    #palier de vaporisation
+    elif Tmoderateur >= T_ebullition or frac_vap > 0.0:
+        temp_finale = T_ebullition
+        if bilan > 0 :
+            delta_frac = bilan/(masse_eau * L_vap)
+            frac_vap_finale = min(frac_vap + delta_frac, 1.0)
+        else :
+            delta_frac = bilan/(masse_eau * L_vap)
+            frac_vap_finale = max(frac_vap + delta_frac, 0.0)
+
+        #vaporisation complete :
+        if frac_vap_finale >= 1.0:
+            frac_vap_finale = 1.0
+        #condensation complete :
+        if frac_vap_finale <= 0.0 :
+            frac_vap_finale = 0.0
+            # gestion de l'energie résiduelle :
+            Q_residuel = bilan + frac_vap * masse_eau * L_vap
+            temp_finale = T_ebullition + Q_residuel/capacithe_mod_tot
+            #si refroidissement : Tmoderateur descend en dessous de T_ebullition :
+            temp_finale = min(temp_finale, T_ebullition)
+
+    return (temp_finale,frac_vap_finale)
+
+##%% Test de l'accumulation des neutrons dans le système: fission à 6 facteurs couplé thermodynamiquement.
+
+atomes_U235 = ((densite_tot * Vtot) / masse_mol_U5) * avogadro
+
+def test(N):
+
+    #Définitions des variables et constantes (voir le haut du script pour les unités et explications).
+    n_eV = [0.0253, 4.6*10**9, 5*10**9]
+    coeff_desintegration = 3.12*10**(-17)
+    n_cree_probas = [0.035, 0.365, 0.51,0.085, 0.005]
+    n_cree_moy = 2.47
+    section_efficace_f_init = [585, 1.2]
+    section_efficace_abs = [680,1.29]
+    section_efficace_totale = [700,5]
+    n_vitesse = [2200,2.46*10**7]
+
+    masse_mol_U5 = 0.235
+    avogadro = 6.02214*10**23
+
+    t_g_n = 10**(-4)
+    neutrons_produits = [0,0]
+    gamma = 0.069
+
+    n_fission = [0,0]
+    distance_moy = 0.7875
+    R = 2.1
+    H = 0.7
+    fraction_laterale =  2*np.pi*R*H /  (2*np.pi*R*H + 2*np.pi*R**2)
+    B2 = (2.405/R)**2+(np.pi/H)**2
+
+    Text = 273.15 + 25
+
+    Tgres = 273.15 + 150
+    conduct_gres = 3
+
+    P = 150
+
+    T_ebullition = 638
+    vapeur_eau = False
+    T_moderateur = 273.15 + 150
+    densite_eau = 0.9232
+    rho_liq_eb = 732
+    rho_vap_eb = 59
+    T_ebullition = 615
+    frac_vap = 0.0
+
+    porosite_refl_lateral = 0.15
+    conduct_conglo = 0.3
+
+    porosite_refl_sup_inf = 0.1
+    conduct_argile = 1.3
+    capacite_th_argile = 1350
+    roh_argile = 1700*0.9 + 997*0.1
+
+
+    T_coeur = 273.15 + 150
+    surface_coeur = (2*np.pi*R**2)*2 + 2*np.pi*R*H
+
+    Vtot = (np.pi*R**2)*H
+
+
+    densite_tot = 16.35
+    atomes_U235 = ((densite_tot * Vtot) / masse_mol_U5) * avogadro
+    #Tableau de résultats
+    tab_crit = []
+    tab_crit_eff = []
+    tab_n_0 = []
+    tab_n_1 = []
+    tab_f_0 = []
+    tab_f_1 = []
+    tab_t_mod = []
+    tab_t_coeur = []
+    tab_frac_vap = []
+    tab_rho_eff = []
+
+    for i in range(N):
+        #actualisation des données comparatives
+        n_fission[0] = n_fission[1] #nombre de fissions à la génération n devient celle à la génération n+1
+
+
+        #fission spontanée (amorçage et production continue de neutrons rapides)
+        n_spont = fission_spontanee(atomes_U235) #neutrons générés par fission spontanée et atomes fissiles restant  dans le coeur.
+        neutrons_produits[1] += n_spont[0] * n_cree_moy
+        atomes_U235 = n_spont[1]
+
+        #entrée dans le cycle de vie du neutron à condition d'avoir au  moins un neutron.
+        #fissions de la génération.
+        if neutrons_produits[1] >= 1 or neutrons_produits[0] >= 1:
+
+            k_eff, rho_eff = criticite(T_coeur,T_moderateur, frac_vap )
+            F_th,F_rapide, N_th_suivant, N_rap_suivant = formule_cinetique_minimal(T_coeur,T_moderateur,k_eff,neutrons_produits[0]+neutrons_produits[1], rho_eff)
+
+            nb = F_th + F_rapide
+            n_fission[1] = nb + n_spont[0]
+            atomes_U235 -= nb #on soustraie le nombre de fission aux nombre d'atome fissile.
+            neutrons_produits = [N_th_suivant,N_rap_suivant]
+        # changements de températures dû aux fissions :
+            T_coeur, energie_transmise = temperature_coeur(nb + n_spont[0],T_coeur,T_moderateur)
+            T_moderateur, frac_vap = temperature_moderateur(energie_transmise,nb + n_spont[0],T_moderateur,frac_vap)
+        else :
+            k_eff = 0
+            F_th = 0
+            F_rapide = 0
+            rho_eff = densite_effective(T_moderateur, frac_vap)
+            T_coeur, energie_transmise = temperature_coeur(0 ,T_coeur,T_moderateur)
+            T_moderateur, frac_vap = temperature_moderateur(energie_transmise,0 ,T_moderateur,frac_vap)
+
+
+        #remplissage des listes pour l'affichage
+        if i%50 == 0: #on ne retiens/affiche qu'une valeur sur 50 pour des raisons de RAM.
+            if n_fission[0] != 0:
+                tab_crit.append(crit(n_fission[1],n_fission[0]))
+
+            else :
+                tab_crit.append(0)
+
+            tab_crit_eff.append(k_eff)
+            tab_f_0.append(F_th)
+            tab_f_1.append(F_rapide)
+            tab_n_0.append(neutrons_produits[0])
+            tab_n_1.append(neutrons_produits[1])
+            tab_t_coeur.append(T_coeur)
+            tab_t_mod.append(T_moderateur)
+            tab_frac_vap.append(frac_vap)
+            tab_rho_eff.append(rho_eff)
+
+    X=[i +1 for i in range(N) if (i+1)%50 == 1] #une valeur sur 50 affichée.
+    #AFFICHAGE
+    plt.figure()
+    plt.subplot(251)
+    plt.plot(X,tab_crit)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Criticité')
+    plt.subplot(252)
+    plt.plot(X,tab_f_0)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Nombre de fissions thermiques')
+    plt.subplot(253)
+    plt.plot(X,tab_f_1)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Nombre de fissions rapides')
+    plt.subplot(254)
+    plt.plot(X,tab_n_0)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Nombre de neutrons thermiques')
+    plt.subplot(255)
+    plt.plot(X,tab_n_1)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Nombre de neutrons rapides')
+    plt.subplot(256)
+    plt.plot(X,tab_t_coeur)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Temperature du coeur (K)')
+    plt.subplot(257)
+    plt.plot(X,tab_t_mod)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Temperature du modérateur (K)')
+    plt.subplot(258)
+    plt.plot(X,tab_crit_eff)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('K_eff')
+    plt.subplot(259)
+    plt.plot(X,tab_frac_vap)
+    plt.xlabel('Génération (0.1 ms)')
+    plt.ylabel('Fraction vaporisée')
+    plt.show()
+    """print(time.time() - t1)"""
