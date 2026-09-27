@@ -42,7 +42,7 @@ universe = openmc.Universe(cells=[cell_core, cell_lat, cell_bas, cell_haut])
 geometry = openmc.Geometry(universe)
 geometry.export_to_xml()
 
-print("Géométrie exportée avec succès !")
+#Affichage et vérification :
 print(f"\nCœur         : R=210cm, H=70cm")
 print(f"Réfl. latéral : épaisseur 70cm (R=210→280cm)")
 print(f"Réfl. haut/bas: épaisseur 70cm")
