@@ -1,0 +1,121 @@
+Problématique du TIPE retenu : Quelles sont les différences entre la modélisation stochastique et déterministe d’un réacteur nucléaire naturel ?
+Objectif : Simuler et faire apparaitre les cycles de fonctionnement (30m de fonctionnement pour 2H30 de refroidissement) du réacteur R9 d'Oklo.
+
+
+Données de simulation : 
+- Fraction de volume pris en uraninite : 5% à masse volumique 10 600 kg m-3 : “the uranium content is defined here by a uraninite volume fraction VUO2 taken equal to 5%” [1].
+Donc masse d’uraninite dans le volume total : 5140 kg , or la fraction massique d’uranium dans l’uraninite est de 88.15% donc M_U = 4530 kg. Cependant seul 3.5% de l’uranium était à l’époque d’isotope 235 donc M_U235 = 158.6 kg. 
+Enfin une densité dans le coeur de 16.35 kg.m-3 : “Natural abundance of uranium 235 (U5) at that time was about 3.5% against 0.72% today”.[1]
+- Composition simplifiée provenant de : “The typical ore sample used in this study is defined as a homogeneous initial matrix,
+which is numerically defined by two main volumes: (i) a solid volume (clay, UO2, silica); and (ii) a fluid volume fraction located in all forms of porosity even the intrinsic
+porosity of clays (moderator: water and/or HC).” [1].
+- On a donc des réflecteurs latéraux composés de conglomérat de porosité = 15%
+et des réflecteurs inférieurs et supérieurs en argile de porosité = 10%
+- Forme de lentille modélisée par un cylindre de rayon 210 cm : lentille : 12m de long, 7 de large et 70cm d’épaisseur initiale.
+- Température ambiante de 150°C, pression hydrostatique de 150 bars (eau bien liquide), pour une densité d’eau de 0.9232 g.cm–3
+concentration en poison (boson-10) inconnue car les poisons neutroniques sont supposés “lavés” par les entrées et sorties d’eau naturels.
+- Temps de demi-vie de l’uranium 235 pour la désintégration alpha :T1/2 =  7.04 x 10**8 années donc T1/2 = 2.22*10**16 secondes, donc lambda = ln(2)/T/2 = 3.12*10**-17 s-1. Comme une génération correspond à 1h réelle, pour g le nombre de générations  : n(g) = n0*exp(-lambda*3600*g)
+On considère la conductivité thermique du conglomérat à 0.3 par sa porosité/saturation en eau.
+- Données neutroniques (sections efficaces de réactions) classiques. [2]
+
+Simplifications techniques et considérations du modèle : 
+
+- Le taux de fission, nombre de fissions, nombre de neutrons restants sont calculés par l'équation de cinétique neutronique à deux groupes (neutrons thermiques et rapides).
+On s'intéresse à la population neutronique totale ainsi que la criticité du réacteur calculé grâce à la formule fondamentale à 6 facteurs : k_eff = η × ε × p × f × P_NL_th × P_NL_f. Avec : 
+η : le facteur de reproduction : nombre moyen de neutrons produits par fission * quotient de la section eff de fission et de la section efficace totale (microscopique).
+ε : 1 + fraction de neutrons rapides (très proche de 1).
+p : probabilité d’échapper à la résonance  = 1 car pas de poisons neutroniques : pas de (U238) surtout. Grosse erreur : il faut considérer l’effet Doppler neutronique causé par l’U238,
+donc je décide de le modéliser de manière phénoménologique, puis nous le validerons. p(T) = p_0 × exp(-γ × (√T - √T_0)), où p_0 est la probabilité à froid (température T_0) = 0.95 
+et gamma est le facteur élargissement Doppler pour l’U238 = 0.069.
+f : le facteur d'utilisation thermique est la fraction des neutrons thermiques absorbés dans le combustible = 1 car le cœur est homogène, pas de poisons dans celui là non plus.
+P_NL_th : Probabilité de non-fuite thermique, avec p_lat  et p_vert les probabilités de non échappement latérale et verticale : P_NL_th = (S_lat × ρ_lat + S_vert × ρ_vert) / (S_lat + S_vert)
+P_NL_r : Probabilité de non-fuite rapide, qui est le même dans notre cas que P_NL_th. 
+- Fission induite par rayons cosmiques négligés, spin et symétrie quantique négligée.
+- Pour la réflexion des neutrons, au vu de l'épaisseur des réflecteurs (horizontaux en conglomérats) entourant le réacteur, il est légitime de supposer que la totalité est réfléchie,
+en réalité 90% des neutrons thermiques sont réfléchis latéralement mais pas de manière nécessairement rétrograde, tandis qu’une plus faible portion est réfléchie par les réflecteurs (supérieurs et inférieurs en argile) : 50%.
+- Le taux d’augmentation de la température au sein du réacteur est fonction d’un nombre absurde de variables : énergie cinétique des neutrons, rayonnement gamma et
+bêta des désintégration de produits de fission et enfin l’émission de neutrinos. PAGE 409.
+- Au cœur du réacteur : considère qu’un tiers des rayons gamma est absorbé soit autour de 5 MeV, 8 MeV pour les rayons bêta et 168 MeV pour les produits de fission,
+pour un total de 181 MeV absorbé par fission. Cela représente 90% de l'énergie totale par fission dans tout le réacteur. Intéressant pour l'effet Doppler en neutronique que je vais surement intégrer dans ma simulation.
+- Le reste (20 MeV) est absorbé par le modérateur, réflecteur. C’est intéressant pour l’augmentation de température de l’eau, ayant une importance capitale pour le fonctionnement du réacteur.
+TOUTE l'énergie cinétique absorbée par les matériaux est convertie en énergie thermique, donc 20 MeV = 3.2*10-12 J
+Après quelques jours de fonctionnement, autour de 7% de l'énergie thermique à venir provient de l’émission de rayons gamma et bêta des produits de fission. PAGE 414.
+Ce qui fait un total de 194.6 MeV pour le cœur et 21.5 MeV pour le modérateur par fission.
+On considère le transfert thermique par conduction entre le cœur et le modérateur/réflecteur, ainsi que celui entre le modérateur/réflecteur et l'extérieur. 
+Sachant que la valeur de la conductivité thermique des matériaux dépend aussi de l’humidité et de la température, qui nécessitent les conductivités thermiques afin de les déterminer,
+je me retrouve bloqué. On les suppose alors constantes. Pour l’argile poreux à 10% rempli d’eau, la valeur tabulé est exactement 1.298, tandis que pour le conglomérat
+poreux à 15% on suppose que sa conductivité est de 0.3 W.m-1.K-1.La conductivité thermique du coeur (UO2) est un polynôme dépendant de la température.
+Pour connaître la variation de température, on commence par les flux thermique (j’ai mesuré la longueur de l’argile à 1.7m en moyenne), puis les transferts thermiques,
+et enfin on applique un premier principe de la thermodynamique pour une phase condensée ne subissant aucun travail mécanique, alors : dT = Q / mc. Avec pour capacité 
+thermique du noyau/cœur un polynôme dépendant de la température.
+
+Je ne peux pas négligé l'effet Doppler neutronique malgrè son effet très faible. La section de fission de U235 est très régulière à basse énergie et suit bien la loi 1/v.
+L’effet Doppler modifie peu la fission directe.
+FAUX car : “Those thermal effects result from two combined phenomena: the temperature dependence of the moderation due to the volume dilatation, 
+and the temperature dependence of neutrons captured by the 238 U resonances which is directly proportional to the temperature variation. 
+The last effect is usually known as ‘‘the Doppler’’ effect in reactor physics, the power level where this effect starts being called the ‘‘Doppler threshold’’. 
+In some specific situations of industrial reactors the moderator contribution to the thermal effect may be slightly positive. 
+Due to the composition of the moderator and the presence of solid initial poisons, that contribution was probably always negative in Oklo” [1].
+Composition isotopique négligé : pas de U238 capable de capter des neutrons pour produire des Pu239
+
+Difficultés rencontrés :
+- Difficultés théoriques :
+  - La température du modérateur n'augmente pas suffisamment par rapport à la température du cœur. Le problème de modélisation est le suivant : 
+j’ai modélisé l’augmentation en température comme une moyenne sur le réflecteur (argile) et sur le modérateur (eau), or ces matériaux se partagent bien l'énergie émise par le coeur,
+cependant l'intérêt se porte sur la température de l’eau, pas celle de l’argile. Solution : relever uniquement la température du modérateur, pas la température moyenne entre le modérateur
+et l'environnement extérieur (argile)
+  - Fonction de fission renvoie une valeur bien trop grande : 10**42 au lieu de 10**17 fissions par minutes, rien qu’au stade de désintégration. Fausse alerte :
+problème d’unité barn -> cm-2. J’ai tout de même un facteur 10**6 (en effet le programme renvoie 1.8*10**23 avec les neutrons rapides issus de la désintégration.
+  - Solution : Intégrer l’effet de la température sur la section efficace de fission. Approximation en sigma * 1/(T)**½.
+  - La formule à 6 facteurs renvoie dans les deux cas (eau liquide et eau vaporisée) k_eff > 1, le réacteur est surcritique : il y a donc un erreur de modélisation de plusieurs possibilité : 
+      - Les facteurs de réflection sont trop forts, cependant il y a peu de chance que ce soit ça au vu de la taille du cœur par rapport à la distance de libre parcours des neutrons.
+      - La négligeance de certains poisons peut être trop forte : U238 par exemple (c'est cette possibilité là).
+  - J’ai confondu la fission spontanée par la désintégration alpha !
+  - La fission spontanée ne produit que 0.0061 neutron par génération, ça n’a pas de sens physique et bloque le réamorçage du réacteur car celui-ci est un événement rare et discret, pas un processus continu.
+  - Densité de l’eau à 150 bars est compliquée, certes l’eau est incompressible et l’erreur est de moins d’1% pour l’eau liquide, mais la température d'ébullition monte à 340 deg celsius, donc en dehors du 
+domaine de validité du polynôme utilisé. On utilise alors la corrélation IAPWS-IF97 pour l’eau sous pression.
+  - Ajout d’une nouvelle variable d'état : la fraction d’eau vaporisée à incorporer dans tous le programme. J’en peux plus.
+  - Je me suis trompé sur la “correction spectrale”, soit la décroissance des sections efficaces de fissions des neutrons thermiques quand la température augmente.
+Il s’agit de la température de l’eau/modérateur et pas celle du combustible/cœur. Ça a eu pour conséquence d’autoréguler trop vite le réacteur.
+  - Encore des problèmes de thermodynamique : j’ai mal incorporé le rôle de l’argile/roche dans le stockage de la chaleur, et surtout ma modélisation
+de la diffusion/conduction thermique de Newton du cœur vers le modérateur est surfacique alors qu’il devrait être volumique.
+
+- Problèmes techniques :
+  - Difficultés à calculer le nombre de fission, qui dépend de la profondeur de matière fissile traversée par le neutron. Impossible de simuler chaque neutron produits par fission ou désintégration
+(donc à des emplacements différents dans le cœur), allant dans différentes directions. On prend donc la distance moyenne parcourue par un neutron entre un point aléatoire du cylindre (coeur)
+jusqu’à l'extrémité du coeur : formule dérivée de celle de Cauchy : L = 1.5*R*H / (H + R), donc dans notre cas : L = 78.75 cm.
+  - Malgré la complexité linéaire (calculé et mesuré), le programme est très long à exécuter (40m pour simuler 2h)
+manque d’espace de mémoire vive pour stocker et afficher les graphes de plusieurs millions d’entrés (j’ai donc prit une mesure sur 100)
+
+HISTORIQUE DES CHANGEMENTS D’ECHELLES : 1 génération correspond à :
+- 1 minute
+- 1 milliseconde
+- 0.1 milliseconde
+- (abandon, il faut un pas de temps adaptatif)
+
+Complexité temporelle de l’algorithme “final” (Pas l’algorithme adapté par Claude) : 
+y=0.0000330201x+0.155514 avec R = 0.98
+y en secondes et x en génération (0.1 ms simulée)
+
+
+
+Résultats et limites :
+
+Outre les limites technologique liés à la complexité temporelle et au stockage, un probleme vient du fait que le cycle est établie en régime permanent, 
+mais cela dépends beaucoup trop des valeurs initiales (de température par exemple dont je ne peux être certain) ainsi que de facteurs tabulés ou phénoménologiques 
+qui changent le résultat pour une petite différence de valeur entre le réel et ce qui est utilisé.
+J'en suis donc venu à faire adapter et modifier le code par Claude, qui a révéler quelques manquement théoriques (ne me permettant pas de conclure puisque c'est MOI le facteur limitant dans cette experience
+de comparaison de modèles/simulations), notamment :
+- Absence de neutrons retardés. C'est le point décisif. Avec beta = 0, toute la dynamique est gouvernée par Lambda = 1e-4 s : un réacteur à k = 1,01 double sa puissance en 16 ms.
+Un cycle de 30 minutes est mathématiquement impossible dans ce cadre. Les neutrons retardés portent la période à la minute.
+- Source d'amorçage 1e4 fois trop faible, deux fois. Première fois : fission_spontanee applique un taux à l'U235 seul, alors que c'est l'U238 qui domine d'un facteur 1200 (6,8e-3 contre 5,7e-6 fissions/g/s).
+On obtenait 25 n/s au lieu de 3,6e5. Seconde fois : dans formule_cinetique_minimal (ligne 163), S_ext est déjà exprimé par génération mais il est re-multiplié par dt = 1e-4. Conséquence :
+le réamorçage du réacteur était bloqué, ce qui était noté comme une difficulté dans le compte rendu.
+- Un flux traité comme une énergie (temperature_moderateur, lignes 244-245), perte est en watts (500 W/m3/K x delta_T x V) puis soustraite d'un gain en joules. Le facteur * 10**(-4) a disparu — il est resté 
+dans la version commentée juste au-dessus, et dans temperature_coeur. La perte du modérateur était 10 000 fois trop grande.
+- Effet Doppler faux d'un facteur ~500, et appliqué au mauvais milieu, Entre 293 K et 600 K cela fait chuter k de 40 %, soit environ 1300 pcm/K, alors que le Doppler réel vaut -2 à -3 pcm/K.
+De plus il dépend de la température du combustible (résonances de l'U238), pas du modérateur. Le p_0 = 0,95 mentionné dans le compte rendu était absent du code.
+- f = 0.66 constante ajustée par le calcul (facteur d'utilisation thermique).
+
+
+Merci pour votre lecture.
